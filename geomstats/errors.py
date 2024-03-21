@@ -8,7 +8,7 @@ import geomstats.backend as gs
 
 def check_integer(n, n_name):
     """Raise an error if n is not a > 0 integer.
-    ### just modif test for git
+
     Parameters
     ----------
     n : unspecified
