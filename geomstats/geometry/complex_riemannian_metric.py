@@ -5,39 +5,16 @@ Lead author: Yann Cabanes.
 
 import geomstats.backend as gs
 from geomstats.geometry.riemannian_metric import RiemannianMetric
+from geomstats.vectorization import check_is_batch
 
 
 class ComplexRiemannianMetric(RiemannianMetric):
     r"""Class for Riemannian and pseudo-Riemannian metrics for Complex manifolds.
 
     The associated Levi-Civita connection on the tangent bundle.
-
-    Parameters
-    ----------
-    dim : int
-        Dimension of the manifold.
-    shape : tuple of int
-        Shape of one element of the manifold.
-        Optional, default : (dim, ).
-    signature : tuple
-        Signature of the metric.
-        Optional, default: None.
-    default_coords_type : str, {\'intrinsic\', \'extrinsic\', etc}
-        Coordinate type.
-        Optional, default: 'intrinsic'.
     """
 
-    def __init__(
-        self, dim, shape=None, signature=None, default_coords_type="intrinsic"
-    ):
-        super(ComplexRiemannianMetric, self).__init__(
-            dim=dim,
-            shape=shape,
-            signature=signature,
-            default_coords_type=default_coords_type,
-        )
-
-    def inner_product(self, tangent_vec_a, tangent_vec_b, base_point):
+    def inner_product(self, tangent_vec_a, tangent_vec_b, base_point=None):
         """Inner product between two tangent vectors at a base point.
 
         Parameters
@@ -57,8 +34,7 @@ class ComplexRiemannianMetric(RiemannianMetric):
         """
         inner_prod_mat = self.metric_matrix(base_point)
         aux = gs.einsum("...j,...jk->...k", gs.conj(tangent_vec_a), inner_prod_mat)
-        inner_prod = gs.dot(aux, tangent_vec_b)
-        return inner_prod
+        return gs.dot(aux, tangent_vec_b)
 
     def squared_norm(self, vector, base_point=None):
         """Compute the square of the norm of a vector.
@@ -72,7 +48,6 @@ class ComplexRiemannianMetric(RiemannianMetric):
             Vector.
         base_point : array-like, shape=[..., dim]
             Base point.
-            Optional, default: None.
 
         Returns
         -------
@@ -80,10 +55,9 @@ class ComplexRiemannianMetric(RiemannianMetric):
             Squared norm.
         """
         sq_norm = self.inner_product(vector, vector, base_point)
-        sq_norm = gs.real(sq_norm)
-        return sq_norm
+        return gs.real(sq_norm)
 
-    def random_unit_tangent_vec(self, base_point, n_vectors=1):
+    def random_unit_tangent_vec(self, base_point=None, n_vectors=1):
         """Generate a random unit tangent vector at a given point.
 
         Parameters
@@ -100,15 +74,16 @@ class ComplexRiemannianMetric(RiemannianMetric):
         normalized_vector : array-like, shape=[..., n_vectors, dim]
             Random unit tangent vector at base_point.
         """
-        shape = base_point.shape
-        if len(shape) > 1 and shape[-2] > 1 and n_vectors > 1:
+        is_batch = check_is_batch(self._space.point_ndim, base_point)
+        if is_batch and n_vectors > 1:
             raise ValueError(
                 "Several tangent vectors is only applicable to a single base point."
             )
+        dtype = gs.get_default_cdtype() if base_point is None else base_point.dtype
+        point_shape = self._space.shape
         random_vector = gs.squeeze(
-            gs.cast(gs.random.rand(n_vectors, *shape), dtype=gs.get_default_cdtype())
-            + 1j
-            * gs.cast(gs.random.rand(n_vectors, *shape), dtype=gs.get_default_cdtype())
+            gs.cast(gs.random.rand(n_vectors, *point_shape), dtype=dtype)
+            + 1j * gs.cast(gs.random.rand(n_vectors, *point_shape), dtype=dtype)
         )
         normalized_vector = self.normalize(random_vector, base_point)
         return gs.squeeze(normalized_vector)

@@ -29,7 +29,7 @@ def broadcast_lists(list_a, list_b):
 
 
 def _manipulate_input(arg):
-    if not (type(arg) in [list, tuple]):
+    if type(arg) not in [list, tuple]:
         return [arg]
 
     return arg
@@ -89,21 +89,30 @@ class Point(ABC):
 
 
 class PointSet(ABC):
-    r"""Class for a set of points of type Point.
+    r"""Class for a set of points of type Point."""
 
-    Parameters
-    ----------
-    param: int
-        Parameter defining the pointset.
+    def __init__(self, equip=True):
+        if equip:
+            self.equip_with_metric()
 
-    default_point_type : str, {\'vector\', \'matrix\', \'Point\'}
-        Point type.
-        Optional, default: \'Point\'.
+    def equip_with_metric(self, Metric=None, **metric_kwargs):
+        """Equip manifold with Metric.
 
-    default_coords_type : str, {\'intrinsic\', \'extrinsic\', etc}
-        Coordinate type.
-        Optional, default: \'intrinsic\'.
-    """
+        Parameters
+        ----------
+        Metric : PointSetMetric object
+            If None, default metric will be used.
+        """
+        if Metric is None:
+            out = self.default_metric()
+            if isinstance(out, tuple):
+                Metric, kwargs = out
+                kwargs.update(metric_kwargs)
+                metric_kwargs = kwargs
+            else:
+                Metric = out
+
+        self.metric = Metric(self, **metric_kwargs)
 
     @abstractmethod
     def belongs(self, point, atol):
@@ -161,22 +170,15 @@ class PointSetMetric(ABC):
 
     Parameters
     ----------
-    Set : PointSet
-        Underling PointSet.
-    default_point_type : str, {\'vector\', \'matrix\', \'Point\' }
-        Point type.
-        Optional, default: \'Point\'.
-    default_coords_type : str, {\'intrinsic\', \'extrinsic\', etc}
-        Coordinate type.
-        Optional, default: \'intrinsic\'.
+    space : PointSet
+        Set to equip with metric.
     """
 
-    def __init__(self, space: PointSet, **kwargs):
-        super().__init__(**kwargs)
-        self.space = space
+    def __init__(self, space):
+        self._space = space
 
     @abstractmethod
-    def dist(self, point_a, point_b, **kwargs):
+    def dist(self, point_a, point_b):
         """Distance between two points in the PointSet.
 
         Parameters
@@ -193,7 +195,7 @@ class PointSetMetric(ABC):
         """
 
     @abstractmethod
-    def geodesic(self, initial_point, end_point, **kwargs):
+    def geodesic(self, initial_point, end_point):
         """Compute the geodesic in the PointSet.
 
         Parameters

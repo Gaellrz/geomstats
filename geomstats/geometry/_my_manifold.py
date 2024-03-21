@@ -7,6 +7,7 @@ Note: A manifold needs to be created with an associated test file.
 The test file for this manifold can be found at:
 tests/test__my_manifold.py.
 """
+
 import geomstats.backend as gs
 
 # Import the class(es) that MyManifold inherits from
@@ -35,8 +36,8 @@ class MyManifold(Manifold):
         Dimension of the manifold.
     """
 
-    def __init__(self, dim, another_parameter, **kwargs):
-        super().__init__(dim, shape=(dim,))
+    def __init__(self, dim, another_parameter):
+        super().__init__(dim, shape=(dim,), equip=False)
         self.another_parameter = another_parameter
 
     # Implement the main methods of MyManifold, for example belongs:
@@ -97,7 +98,6 @@ class MyManifold(Manifold):
             Vector.
         base_point : array-like, shape=[..., dim]
             Point on the manifold.
-            Optional, default: None.
         atol : float
             Absolute tolerance threshold
 
@@ -113,7 +113,7 @@ class MyManifold(Manifold):
             is_tangent = gs.tile([is_tangent], (vector.shape[0],))
         return is_tangent
 
-    def to_tangent(self, vector, base_point):
+    def to_tangent(self, vector, base_point=None):
         """Project a vector to a tangent space of the manifold.
 
         Parameters

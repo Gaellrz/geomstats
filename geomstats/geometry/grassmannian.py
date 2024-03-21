@@ -38,89 +38,11 @@ References
 import geomstats.backend as gs
 import geomstats.errors
 from geomstats.geometry.base import LevelSet
-from geomstats.geometry.euclidean import EuclideanMetric
 from geomstats.geometry.general_linear import GeneralLinear
-from geomstats.geometry.matrices import Matrices, MatricesMetric
+from geomstats.geometry.matrices import Matrices
+from geomstats.geometry.riemannian_metric import RiemannianMetric
 from geomstats.geometry.symmetric_matrices import SymmetricMatrices
-
-
-def _squared_dist_grad_point_a(point_a, point_b, metric):
-    """Compute gradient of squared_dist wrt point_a.
-
-    Compute the Riemannian gradient of the squared geodesic
-    distance with respect to the first point point_a.
-
-    Parameters
-    ----------
-    point_a : array-like, shape=[..., dim]
-        Point.
-    point_b : array-like, shape=[..., dim]
-        Point.
-    metric : SpecialEuclideanMatrixCanonicalLeftMetric
-        Metric defining the distance.
-
-    Returns
-    -------
-    _ : array-like, shape=[..., dim]
-        Riemannian gradient, in the form of a tangent
-        vector at base point : point_a.
-    """
-    return -2 * metric.log(point_b, point_a)
-
-
-def _squared_dist_grad_point_b(point_a, point_b, metric):
-    """Compute gradient of squared_dist wrt point_b.
-
-    Compute the Riemannian gradient of the squared geodesic
-    distance with respect to the second point point_b.
-
-    Parameters
-    ----------
-    point_a : array-like, shape=[..., dim]
-        Point.
-    point_b : array-like, shape=[..., dim]
-        Point.
-    metric : SpecialEuclideanMatrixCanonicalLeftMetric
-        Metric defining the distance.
-
-    Returns
-    -------
-    _ : array-like, shape=[..., dim]
-        Riemannian gradient, in the form of a tangent
-        vector at base point : point_b.
-    """
-    return -2 * metric.log(point_a, point_b)
-
-
-@gs.autodiff.custom_gradient(_squared_dist_grad_point_a, _squared_dist_grad_point_b)
-def _squared_dist(point_a, point_b, metric):
-    """Compute geodesic distance between two points.
-
-    Compute the squared geodesic distance between point_a
-    and point_b, as defined by the metric.
-
-    This is an auxiliary private function that:
-
-    - is called by the method `squared_dist` of the class
-      SpecialEuclideanMatrixCanonicalLeftMetric,
-    - has been created to support the implementation
-      of custom_gradient in tensorflow backend.
-
-    Parameters
-    ----------
-    point_a : array-like, shape=[..., dim]
-        Point.
-    point_b : array-like, shape=[..., dim]
-        Point.
-    metric : SpecialEuclideanMatrixCanonicalLeftMetric
-        Metric defining the distance.
-
-    Returns
-    -------
-    _ : array-like, shape=[...,]
-        Geodesic distance between point_a and point_b.
-    """
-    return metric.private_squared_dist(point_a, point_b)
+from geomstats.vectorization import repeat_out
 
 
 class Grassmannian(LevelSet):
@@ -134,7 +56,7 @@ class Grassmannian(LevelSet):
         Dimension of the subspaces.
     """
 
-    def __init__(self, n, p, **kwargs):
+    def __init__(self, n, p, equip=True):
         geomstats.errors.check_integer(p, "p")
         geomstats.errors.check_integer(n, "n")
         if p > n:
@@ -145,12 +67,16 @@ class Grassmannian(LevelSet):
         self.n = n
         self.p = p
 
-        kwargs.setdefault("metric", GrassmannianCanonicalMetric(n, p))
         dim = int(p * (n - p))
-        super().__init__(dim=dim, **kwargs)
+        super().__init__(dim=dim, equip=equip)
 
     def _define_embedding_space(self):
         return SymmetricMatrices(self.n)
+
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return GrassmannianCanonicalMetric
 
     def submersion(self, point):
         r"""Submersion that defines the Grassmann manifold.
@@ -312,33 +238,14 @@ class Grassmannian(LevelSet):
         return Matrices.mul(p_d, Matrices.transpose(eigvecs))
 
 
-class GrassmannianCanonicalMetric(MatricesMetric):
-    """Canonical metric of the Grassmann manifold.
+class GrassmannianCanonicalMetric(RiemannianMetric):
+    """Canonical metric of the Grassmann manifold."""
 
-    Coincides with the Frobenius metric.
+    def __init__(self, space):
+        super().__init__(space=space, signature=(space.dim, 0, 0))
+        self._general_linear = GeneralLinear(space.n, equip=False)
 
-    Parameters
-    ----------
-    n : int
-        Dimension of the Euclidean space.
-    p : int
-        Dimension of the subspaces.
-    """
-
-    def __init__(self, n, p):
-        geomstats.errors.check_integer(p, "p")
-        geomstats.errors.check_integer(n, "n")
-        if p > n:
-            raise ValueError("p <= n is required.")
-
-        dim = int(p * (n - p))
-        super().__init__(m=n, n=n, dim=dim, signature=(dim, 0, 0))
-
-        self.n = n
-        self.p = p
-        self.embedding_metric = EuclideanMetric(n * p)
-
-    def exp(self, tangent_vec, base_point, **kwargs):
+    def exp(self, tangent_vec, base_point):
         """Exponentiate the invariant vector field v from base point p.
 
         Parameters
@@ -360,7 +267,7 @@ class GrassmannianCanonicalMetric(MatricesMetric):
         rot = Matrices.bracket(base_point, -tangent_vec)
         return mul(expm(rot), base_point, expm(-rot))
 
-    def log(self, point, base_point, **kwargs):
+    def log(self, point, base_point):
         r"""Compute the Riemannian logarithm of point w.r.t. base_point.
 
         Given :math:`P, P'` in :math:`Gr(n, p)` the logarithm from :math:`P`
@@ -391,16 +298,15 @@ class GrassmannianCanonicalMetric(MatricesMetric):
             "Geometric Mean and Geodesic Regression on Grassmannians"
             Linear Algebra and its Applications, 466, 83-101, 2015.
         """
-        GLn = GeneralLinear(self.n)
-        id_n = GLn.identity
+        id_n = self._general_linear.identity
         id_n, point, base_point = gs.convert_to_wider_dtype([id_n, point, base_point])
         sym2 = 2 * point - id_n
         sym1 = 2 * base_point - id_n
-        rot = GLn.compose(sym2, sym1)
-        return Matrices.bracket(GLn.log(rot) / 2, base_point)
+        rot = self._general_linear.compose(sym2, sym1)
+        return Matrices.bracket(self._general_linear.log(rot) / 2, base_point)
 
     def parallel_transport(
-        self, tangent_vec, base_point, tangent_vec_b=None, end_point=None
+        self, tangent_vec, base_point, direction=None, end_point=None
     ):
         r"""Compute the parallel transport of a tangent vector.
 
@@ -415,19 +321,19 @@ class GrassmannianCanonicalMetric(MatricesMetric):
             Tangent vector at base point to be transported.
         base_point : array-like, shape=[..., n, n]
             Point on the Grassmann manifold. Point to transport from.
-        tangent_vec_b : array-like, shape=[..., n, n]
+        direction : array-like, shape=[..., n, n]
             Tangent vector at base point, along which the parallel transport
             is computed.
             Optional, default: None
         end_point : array-like, shape=[..., n, n]
             Point on the Grassmann manifold to transport to. Unused if
-            `tangent_vec_b` is given.
+            `direction` is given.
             Optional, default: None
 
         Returns
         -------
         transported_tangent_vec: array-like, shape=[..., n, n]
-            Transported tangent vector at `exp_(base_point)(tangent_vec_b)`.
+            Transported tangent vector at `exp_(base_point)(direction)`.
 
         References
         ----------
@@ -436,48 +342,20 @@ class GrassmannianCanonicalMetric(MatricesMetric):
             Aspects.” ArXiv:2011.13699 [Cs, Math], November 27, 2020.
             https://arxiv.org/abs/2011.13699.
         """
-        if tangent_vec_b is None:
+        if direction is None:
             if end_point is not None:
-                tangent_vec_b = self.log(end_point, base_point)
+                direction = self.log(end_point, base_point)
             else:
                 raise ValueError(
-                    "Either an end_point or a tangent_vec_b must be given to define the"
+                    "Either an end_point or a direction must be given to define the"
                     " geodesic along which to transport."
                 )
         expm = gs.linalg.expm
         mul = Matrices.mul
-        rot = -Matrices.bracket(base_point, tangent_vec_b)
+        rot = -Matrices.bracket(base_point, direction)
         return mul(expm(rot), tangent_vec, expm(-rot))
 
-    def private_squared_dist(self, point_a, point_b):
-        """Compute geodesic distance between two points.
-
-        Compute the squared geodesic distance between point_a
-        and point_b, as defined by the metric.
-
-        This is an auxiliary private function that:
-
-        - is called by the method `squared_dist` of the class
-          GrassmannianCanonicalMetric,
-        - has been created to support the implementation
-          of custom_gradient in tensorflow backend.
-
-        Parameters
-        ----------
-        point_a : array-like, shape=[..., dim]
-            Point.
-        point_b : array-like, shape=[..., dim]
-            Point.
-
-        Returns
-        -------
-        _ : array-like, shape=[...,]
-            Geodesic distance between point_a and point_b.
-        """
-        dist = super().squared_dist(point_a, point_b)
-        return dist
-
-    def squared_dist(self, point_a, point_b, **kwargs):
+    def squared_dist(self, point_a, point_b):
         """Squared geodesic distance between two points.
 
         Parameters
@@ -492,10 +370,39 @@ class GrassmannianCanonicalMetric(MatricesMetric):
         sq_dist : array-like, shape=[...,]
             Squared distance.
         """
-        dist = _squared_dist(point_a, point_b, metric=self)
-        return dist
+        sdist_func = super().squared_dist
 
-    def injectivity_radius(self, base_point):
+        def _squared_dist_grad_point_a(point_a, point_b):
+            """Compute gradient of squared_dist wrt point_a."""
+            return -2 * self.log(point_b, point_a)
+
+        def _squared_dist_grad_point_b(point_a, point_b):
+            """Compute gradient of squared_dist wrt point_b."""
+            return -2 * self.log(point_a, point_b)
+
+        @gs.autodiff.custom_gradient(
+            _squared_dist_grad_point_a, _squared_dist_grad_point_b
+        )
+        def _squared_dist(point_a, point_b):
+            """Compute geodesic distance between two points.
+
+            Parameters
+            ----------
+            point_a : array-like, shape=[..., dim]
+                Point.
+            point_b : array-like, shape=[..., dim]
+                Point.
+
+            Returns
+            -------
+            _ : array-like, shape=[...,]
+                Geodesic distance between point_a and point_b.
+            """
+            return sdist_func(point_a, point_b)
+
+        return _squared_dist(point_a, point_b)
+
+    def injectivity_radius(self, base_point=None):
         """Compute the radius of the injectivity domain.
 
         This is is the supremum of radii r for which the exponential map is a
@@ -510,7 +417,7 @@ class GrassmannianCanonicalMetric(MatricesMetric):
 
         Returns
         -------
-        radius : float
+        radius : array-like, shape=[...,]
             Injectivity radius.
 
         References
@@ -521,4 +428,73 @@ class GrassmannianCanonicalMetric(MatricesMetric):
             ArXiv:2011.13699 [Cs, Math], November 27, 2020.
             https://arxiv.org/abs/2011.13699.
         """
-        return gs.pi / 2
+        radius = gs.array(gs.pi / 2)
+        return repeat_out(self._space.point_ndim, radius, base_point)
+
+    def inner_product(self, tangent_vec_a, tangent_vec_b, base_point=None):
+        """Compute Frobenius inner-product of two tangent vectors.
+
+        Coincides with the Frobenius metric.
+
+        Parameters
+        ----------
+        tangent_vec_a : array-like, shape=[..., m, n]
+            Tangent vector.
+        tangent_vec_b : array-like, shape=[..., m, n]
+            Tangent vector.
+        base_point : array-like, shape=[..., m, n]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        inner_prod : array-like, shape=[...,]
+            Frobenius inner-product of tangent_vec_a and tangent_vec_b.
+        """
+        inner_prod = Matrices.frobenius_product(tangent_vec_a, tangent_vec_b)
+        return repeat_out(
+            self._space.point_ndim, inner_prod, tangent_vec_a, tangent_vec_b, base_point
+        )
+
+    def squared_norm(self, vector, base_point=None):
+        """Compute the square of the norm of a vector.
+
+        Squared norm of a vector associated to the inner product
+        at the tangent space at a base point.
+
+        Parameters
+        ----------
+        vector : array-like, shape=[..., dim]
+            Vector.
+        base_point : array-like, shape=[..., dim]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        sq_norm : array-like, shape=[...,]
+            Squared norm.
+        """
+        sq_norm = gs.linalg.norm(vector, axis=(-2, -1)) ** 2
+        return repeat_out(self._space.point_ndim, sq_norm, vector, base_point)
+
+    def norm(self, vector, base_point=None):
+        """Compute norm of a matrix.
+
+        Norm of a matrix associated to the Frobenius inner product.
+
+        Parameters
+        ----------
+        vector : array-like, shape=[..., dim]
+            Vector.
+        base_point : array-like, shape=[..., dim]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        norm : array-like, shape=[...,]
+            Norm.
+        """
+        norm = gs.linalg.norm(vector, axis=(-2, -1))
+        return repeat_out(self._space.point_ndim, norm, vector, base_point)

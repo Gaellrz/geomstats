@@ -7,10 +7,10 @@ Lead author: Nina Miolane.
 """
 
 import abc
+import inspect
 
 import geomstats.backend as gs
 import geomstats.errors
-from geomstats.geometry.riemannian_metric import RiemannianMetric
 
 
 class Manifold(abc.ABC):
@@ -23,17 +23,24 @@ class Manifold(abc.ABC):
     shape : tuple of int
         Shape of one element of the manifold.
         Optional, default : None.
-    metric : RiemannianMetric
-        Metric object to use on the manifold.
-    default_coords_type : str, {\'intrinsic\', \'extrinsic\', etc}
+    intrinsic : bool
         Coordinate type.
-        Optional, default: 'intrinsic'.
+    equip : bool
+        If True, equip space with default metric.
+
+    Attributes
+    ----------
+    point_ndim : int
+        Dimension of point array.
     """
 
     def __init__(
-        self, dim, shape, metric=None, default_coords_type="intrinsic", **kwargs
+        self,
+        dim,
+        shape,
+        intrinsic=True,
+        equip=True,
     ):
-        super().__init__(**kwargs)
         geomstats.errors.check_integer(dim, "dim")
 
         if not isinstance(shape, tuple):
@@ -41,18 +48,78 @@ class Manifold(abc.ABC):
 
         self.dim = dim
         self.shape = shape
-        self.default_coords_type = default_coords_type
-        self._metric = metric
+        self.intrinsic = intrinsic
 
-    @property
-    def default_point_type(self):
-        """Point type.
+        self.point_ndim = len(self.shape)
 
-        `vector` or `matrix`.
+        if equip:
+            self.equip_with_metric()
+
+    def equip_with_metric(self, Metric=None, **metric_kwargs):
+        """Equip manifold with a Riemannian metric.
+
+        Parameters
+        ----------
+        Metric : RiemannianMetric object or instance or ScalarProductMetric instance
+            If None, default metric will be used.
         """
-        if len(self.shape) == 1:
-            return "vector"
-        return "matrix"
+        if Metric is None:
+            out = self.default_metric()
+            if isinstance(out, tuple):
+                Metric, kwargs = out
+                kwargs.update(metric_kwargs)
+                metric_kwargs = kwargs
+            else:
+                Metric = out
+
+        if inspect.isclass(Metric):
+            self.metric = Metric(self, **metric_kwargs)
+        else:
+            if self.metric._space is not self:
+                raise ValueError(
+                    "Cannot equip space with metric instantiated with another space."
+                )
+
+            self.metric = Metric
+
+        return self
+
+    def equip_with_group_action(self, group_action):
+        """Equip manifold with group action.
+
+        Parameters
+        ----------
+        group_action : str
+            Group action.
+        """
+        self.group_action = group_action
+
+    def _check_equip_with_quotient_structure(self):
+        if not hasattr(self, "_quotient_map"):
+            raise ValueError("No quotient structure defined for this manifold.")
+
+        for structure_name in ("metric", "group_action"):
+            if not hasattr(self, structure_name):
+                raise ValueError(f"Need to equip with `{structure_name}` first")
+
+    def equip_with_quotient_structure(self):
+        """Equip manifold with quotient structure.
+
+        Creates attributes `quotient` and `fiber_bundle`.
+        """
+        self._check_equip_with_quotient_structure()
+
+        key = type(self.metric), self.group_action
+
+        out = self._quotient_map.get(key, None)
+        if out is None:
+            raise ValueError(f"No mapping for key: {key}")
+        FiberBundle_, QuotientMetric_ = out
+
+        self.fiber_bundle = FiberBundle_(total_space=self)
+
+        self.quotient = self.new(equip=False)
+        self.quotient.equip_with_metric(QuotientMetric_, total_space=self)
 
     @abc.abstractmethod
     def belongs(self, point, atol=gs.atol):
@@ -60,7 +127,7 @@ class Manifold(abc.ABC):
 
         Parameters
         ----------
-        point : array-like, shape=[..., dim]
+        point : array-like, shape=[..., *point_shape]
             Point to evaluate.
         atol : float
             Absolute tolerance.
@@ -73,14 +140,14 @@ class Manifold(abc.ABC):
         """
 
     @abc.abstractmethod
-    def is_tangent(self, vector, base_point, atol=gs.atol):
+    def is_tangent(self, vector, base_point=None, atol=gs.atol):
         """Check whether the vector is tangent at base_point.
 
         Parameters
         ----------
-        vector : array-like, shape=[..., dim]
+        vector : array-like, shape=[..., *point_shape]
             Vector.
-        base_point : array-like, shape=[..., dim]
+        base_point : array-like, shape=[..., *point_shape]
             Point on the manifold.
         atol : float
             Absolute tolerance.
@@ -93,19 +160,19 @@ class Manifold(abc.ABC):
         """
 
     @abc.abstractmethod
-    def to_tangent(self, vector, base_point):
+    def to_tangent(self, vector, base_point=None):
         """Project a vector to a tangent space of the manifold.
 
         Parameters
         ----------
-        vector : array-like, shape=[..., dim]
+        vector : array-like, shape=[..., *point_shape]
             Vector.
-        base_point : array-like, shape=[..., dim]
+        base_point : array-like, shape=[..., *point_shape]
             Point on the manifold.
 
         Returns
         -------
-        tangent_vec : array-like, shape=[..., dim]
+        tangent_vec : array-like, shape=[..., *point_shape]
             Tangent vector at base point.
         """
 
@@ -126,7 +193,7 @@ class Manifold(abc.ABC):
 
         Returns
         -------
-        samples : array-like, shape=[..., {dim, [n, n]}]
+        samples : array-like, shape=[..., *point_shape]
             Points sampled on the manifold.
         """
 
@@ -140,27 +207,12 @@ class Manifold(abc.ABC):
 
         Returns
         -------
-        regularized_point : array-like, shape=[..., dim]
+        regularized_point : array-like, shape=[..., *point_shape]
             Regularized point.
         """
-        regularized_point = point
-        return regularized_point
+        return gs.copy(point)
 
-    @property
-    def metric(self):
-        """Riemannian Metric associated to the Manifold."""
-        return self._metric
-
-    @metric.setter
-    def metric(self, metric):
-        if metric is not None:
-            if not isinstance(metric, RiemannianMetric):
-                raise ValueError("The argument must be a RiemannianMetric object")
-            if metric.dim != self.dim:
-                metric.dim = self.dim
-        self._metric = metric
-
-    def random_tangent_vec(self, base_point, n_samples=1):
+    def random_tangent_vec(self, base_point=None, n_samples=1):
         """Generate random tangent vec.
 
         Parameters
@@ -168,16 +220,17 @@ class Manifold(abc.ABC):
         n_samples : int
             Number of samples.
             Optional, default: 1.
-        base_point :  array-like, shape={[n_samples, dim], [dim,]}
+        base_point :  array-like, shape={[n_samples, *point_shape], [*point_shape,]}
             Point.
 
         Returns
         -------
-        tangent_vec : array-like, shape=[..., dim]
+        tangent_vec : array-like, shape=[..., *point_shape]
             Tangent vec at base point.
         """
         if (
             n_samples > 1
+            and base_point is not None
             and base_point.ndim > len(self.shape)
             and n_samples != len(base_point)
         ):
@@ -185,8 +238,7 @@ class Manifold(abc.ABC):
                 "The number of base points must be the same as the "
                 "number of samples, when the number of base points is different from 1."
             )
-        return gs.squeeze(
-            self.to_tangent(
-                gs.random.normal(size=(n_samples,) + self.shape), base_point
-            )
+        batch_size = () if n_samples == 1 else (n_samples,)
+        return self.to_tangent(
+            gs.random.normal(size=batch_size + self.shape), base_point
         )

@@ -9,9 +9,13 @@ import geomstats.backend as gs
 from geomstats.algebra_utils import from_vector_to_diagonal_matrix
 from geomstats.geometry.base import LevelSet
 from geomstats.geometry.euclidean import Euclidean
-from geomstats.geometry.hypersphere import HypersphereMetric
+from geomstats.geometry.hypersphere import Hypersphere
 from geomstats.geometry.riemannian_metric import RiemannianMetric
-from geomstats.information_geometry.base import InformationManifoldMixin
+from geomstats.information_geometry.base import (
+    InformationManifoldMixin,
+    ScipyMultivariateRandomVariable,
+)
+from geomstats.vectorization import repeat_out
 
 
 class MultinomialDistributions(InformationManifoldMixin, LevelSet):
@@ -31,12 +35,19 @@ class MultinomialDistributions(InformationManifoldMixin, LevelSet):
         Embedding manifold.
     """
 
-    def __init__(self, dim, n_draws, **kwargs):
+    def __init__(self, dim, n_draws, equip=True):
         self.dim = dim
 
-        kwargs.setdefault("metric", MultinomialMetric(dim=dim, n_draws=n_draws))
-        super().__init__(dim=dim, shape=(dim + 1,), **kwargs)
+        super().__init__(
+            dim=dim, support_shape=(dim + 1,), shape=(dim + 1,), equip=equip
+        )
         self.n_draws = n_draws
+        self._scp_rv = MultinomialRandomVariable(self)
+
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return MultinomialMetric
 
     def _define_embedding_space(self):
         return Euclidean(self.dim + 1)
@@ -99,7 +110,7 @@ class MultinomialDistributions(InformationManifoldMixin, LevelSet):
         ----------
         point: array-like, shape=[..., dim + 1]
             Point in embedding Euclidean space.
-         atol : float
+        atol : float
             Tolerance to evaluate positivity.
 
         Returns
@@ -133,7 +144,11 @@ class MultinomialDistributions(InformationManifoldMixin, LevelSet):
             at the base point.
         """
         component_mean = gs.mean(vector, axis=-1)
-        return gs.transpose(gs.transpose(vector) - component_mean)
+        tangent_vec = gs.transpose(gs.transpose(vector) - component_mean)
+
+        return repeat_out(
+            self.point_ndim, tangent_vec, vector, base_point, out_shape=self.shape
+        )
 
     def sample(self, point, n_samples=1):
         """Sample from the multinomial distribution.
@@ -157,15 +172,25 @@ class MultinomialDistributions(InformationManifoldMixin, LevelSet):
             Note that this can be of shape [n_points, n_samples, dim + 1] if
             several points and several samples are provided as inputs.
         """
-        point = gs.to_ndarray(point, to_ndim=2)
-        samples = []
-        for param in point:
-            counts = gs.from_numpy(multinomial.rvs(self.n_draws, param, size=n_samples))
-            if n_samples == 1:
-                samples.append(counts[0])
-            else:
-                samples.append(counts)
-        return samples[0] if len(point) == 1 else gs.stack(samples)
+        return self._scp_rv.rvs(point, n_samples)
+
+    def point_to_pdf(self, point):
+        """Compute pdf associated to point.
+
+        Compute the probability density function of the Multinomial
+        distribution with parameters provided by point.
+
+        Parameters
+        ----------
+        point : array-like, shape=[..., dim]
+            Point representing a beta distribution.
+
+        Returns
+        -------
+        pdf : function
+            (Discrete) probability density function.
+        """
+        return lambda x: self._scp_rv.pdf(x, point=point)
 
 
 class MultinomialMetric(RiemannianMetric):
@@ -181,12 +206,11 @@ class MultinomialMetric(RiemannianMetric):
         Science, 4(3): 188 - 234, 1989.
     """
 
-    def __init__(self, dim, n_draws):
-        super().__init__(dim=dim, shape=(dim + 1,))
-        self.n_draws = n_draws
-        self.sphere_metric = HypersphereMetric(dim)
+    def __init__(self, space):
+        super().__init__(space)
+        self._sphere = Hypersphere(dim=space.dim)
 
-    def metric_matrix(self, base_point=None):
+    def metric_matrix(self, base_point):
         """Compute the inner-product matrix.
 
         Compute the inner-product matrix of the Fisher information metric
@@ -202,13 +226,7 @@ class MultinomialMetric(RiemannianMetric):
         mat : array-like, shape=[..., dim, dim]
             Inner-product matrix.
         """
-        if base_point is None:
-            raise ValueError(
-                "A base point must be given to compute the " "metric matrix"
-            )
-        base_point = gs.to_ndarray(base_point, to_ndim=2)
-        mat = self.n_draws * from_vector_to_diagonal_matrix(1 / base_point)
-        return gs.squeeze(mat)
+        return self._space.n_draws * from_vector_to_diagonal_matrix(1 / base_point)
 
     @staticmethod
     def simplex_to_sphere(point):
@@ -264,12 +282,9 @@ class MultinomialMetric(RiemannianMetric):
             Tangent vec to the sphere at the image of
             base point by simplex_to_sphere.
         """
-        base_point = gs.to_ndarray(base_point, to_ndim=2)
-        tangent_vec = gs.to_ndarray(tangent_vec, to_ndim=2)
-        tangent_vec_sphere = gs.einsum(
+        return gs.einsum(
             "...i,...i->...i", tangent_vec, 1 / (2 * self.simplex_to_sphere(base_point))
         )
-        return gs.squeeze(tangent_vec_sphere)
 
     @staticmethod
     def tangent_sphere_to_simplex(tangent_vec, base_point):
@@ -290,15 +305,12 @@ class MultinomialMetric(RiemannianMetric):
             Tangent vec to the simplex at the image of
             base point by sphere_to_simplex.
         """
-        base_point = gs.to_ndarray(base_point, to_ndim=2)
-        tangent_vec = gs.to_ndarray(tangent_vec, to_ndim=2)
-        tangent_vec_simplex = gs.einsum("...i,...i->...i", tangent_vec, 2 * base_point)
-        return gs.squeeze(tangent_vec_simplex)
+        return gs.einsum("...i,...i->...i", tangent_vec, 2 * base_point)
 
     def exp(self, tangent_vec, base_point):
         """Compute the exponential map.
 
-        Comute the exponential map associated to the Fisher information
+        Compute the exponential map associated to the Fisher information
         metric by pulling back the exponential map on the sphere by the
         simplex_to_sphere map.
 
@@ -317,7 +329,7 @@ class MultinomialMetric(RiemannianMetric):
         """
         base_point_sphere = self.simplex_to_sphere(base_point)
         tangent_vec_sphere = self.tangent_simplex_to_sphere(tangent_vec, base_point)
-        exp_sphere = self.sphere_metric.exp(tangent_vec_sphere, base_point_sphere)
+        exp_sphere = self._sphere.metric.exp(tangent_vec_sphere, base_point_sphere)
 
         return self.sphere_to_simplex(exp_sphere)
 
@@ -343,7 +355,7 @@ class MultinomialMetric(RiemannianMetric):
         """
         point_sphere = self.simplex_to_sphere(point)
         base_point_sphere = self.simplex_to_sphere(base_point)
-        log_sphere = self.sphere_metric.log(point_sphere, base_point_sphere)
+        log_sphere = self._sphere.metric.log(point_sphere, base_point_sphere)
 
         return self.tangent_sphere_to_simplex(log_sphere, base_point_sphere)
 
@@ -363,7 +375,7 @@ class MultinomialMetric(RiemannianMetric):
             Point on the manifold, end point of the geodesic.
             Optional, default: None.
             If None, an initial tangent vector must be given.
-        initial_tangent_vec : array-like, shape=[..., dim + 1],
+        initial_tangent_vec : array-like, shape=[..., dim + 1]
             Tangent vector at base point, the initial speed of the geodesics.
             Optional, default: None.
             If None, an end point must be given and a logarithm is computed.
@@ -385,7 +397,7 @@ class MultinomialMetric(RiemannianMetric):
             vec_sphere = self.tangent_simplex_to_sphere(
                 initial_tangent_vec, initial_point
             )
-        geodesic_sphere = self.sphere_metric.geodesic(
+        geodesic_sphere = self._sphere.metric.geodesic(
             initial_point_sphere, end_point_sphere, vec_sphere
         )
 
@@ -403,8 +415,7 @@ class MultinomialMetric(RiemannianMetric):
                 Values of the geodesic at times t.
             """
             geod_sphere_at_t = geodesic_sphere(t)
-            geod_at_t = self.sphere_to_simplex(geod_sphere_at_t)
-            return gs.squeeze(geod_at_t)
+            return self.sphere_to_simplex(geod_sphere_at_t)
 
         return path
 
@@ -439,7 +450,7 @@ class MultinomialMetric(RiemannianMetric):
         sectional_curvature : array-like, shape=[...,]
             Sectional curvature at `base_point`.
         """
-        sectional_curv = 2 * gs.sqrt(self.n_draws)
+        sectional_curv = 2 * gs.sqrt(self._space.n_draws)
         if (
             tangent_vec_a.ndim == 1
             and tangent_vec_b.ndim == 1
@@ -457,3 +468,14 @@ class MultinomialMetric(RiemannianMetric):
         n_sec_curv = max(n_sec_curv)
 
         return gs.tile(sectional_curv, (n_sec_curv,))
+
+
+class MultinomialRandomVariable(ScipyMultivariateRandomVariable):
+    """A multinomial random variable."""
+
+    def __init__(self, space):
+        rvs = lambda *args, **kwargs: multinomial.rvs(space.n_draws, *args, **kwargs)
+        pdf = lambda x, *args, **kwargs: multinomial.pmf(
+            x, space.n_draws, *args, **kwargs
+        )
+        super().__init__(space, rvs, pdf)

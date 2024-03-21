@@ -30,34 +30,14 @@ References
 """
 
 import geomstats.backend as gs
-from geomstats.geometry.base import ComplexOpenSet
+from geomstats.geometry.base import ComplexVectorSpaceOpenSet
 from geomstats.geometry.complex_matrices import ComplexMatrices
 from geomstats.geometry.complex_riemannian_metric import ComplexRiemannianMetric
-from geomstats.geometry.hermitian_matrices import HermitianMatrices
+from geomstats.geometry.hermitian_matrices import expmh, powermh
+from geomstats.geometry.matrices import Matrices
 
 
-def _create_identity_mat(shape, dtype):
-    """Stack identity matrices.
-
-    Parameters
-    ----------
-    shape : tuple
-        Desired identity matrix shape of form [..., n, n].
-    dtype : dtype
-        Desired dtype.
-
-    Returns
-    -------
-    identity : array-like, shape=[..., n, n]
-        Stacked identity matrices.
-    """
-    ndim = len(shape)
-    if ndim == 2:
-        return gs.eye(shape[-1], dtype=dtype)
-    return gs.stack([gs.eye(shape[-1], dtype=dtype) for _ in range(shape[0])], axis=0)
-
-
-class Siegel(ComplexOpenSet):
+class Siegel(ComplexVectorSpaceOpenSet):
     """Class for the Siegel space.
 
     Parameters
@@ -68,19 +48,21 @@ class Siegel(ComplexOpenSet):
         If symmetric is True, add a symmetry condition
         on the matrices to belong to the Siegel space.
         Optional, default: False.
-    scale : float
-        Scale of the complex Poincare metric.
-        Optional, default: 1.
     """
 
-    def __init__(self, n, symmetric=False, scale=1.0, **kwargs):
-        kwargs.setdefault("metric", SiegelMetric(n))
+    def __init__(self, n, symmetric=False, equip=True):
         super().__init__(
-            dim=n**2, embedding_space=ComplexMatrices(m=n, n=n), **kwargs
+            dim=n**2,
+            embedding_space=ComplexMatrices(m=n, n=n),
+            equip=equip,
         )
         self.n = n
         self.symmetric = symmetric
-        self.scale = scale
+
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return SiegelMetric
 
     def belongs(self, point, atol=gs.atol):
         """Check if a matrix belongs to the Siegel space.
@@ -102,10 +84,10 @@ class Siegel(ComplexOpenSet):
         aux = gs.matmul(point, point_transconj)
 
         axis = -1 if gs.ndim(point) == 3 else None
-        belongs = gs.all(gs.linalg.eigvalsh(aux) <= 1 - atol, axis=axis)
+        belongs = gs.all(gs.linalg.eigvalsh(aux) <= 1 + atol, axis=axis)
 
         if self.symmetric:
-            return gs.logical_and(belongs, ComplexMatrices.is_symmetric(point))
+            return gs.logical_and(belongs, Matrices.is_symmetric(point))
 
         return belongs
 
@@ -126,7 +108,7 @@ class Siegel(ComplexOpenSet):
             Matrix in the Siegel space.
         """
         if self.symmetric:
-            point = ComplexMatrices.to_symmetric(point)
+            point = Matrices.to_symmetric(point)
 
         point_transconj = ComplexMatrices.transconjugate(point)
         aux = gs.matmul(point, point_transconj)
@@ -172,7 +154,7 @@ class Siegel(ComplexOpenSet):
         samples *= bound * (1 - gs.atol) * 2**0.5 / n
         return samples
 
-    def random_tangent_vec(self, base_point=None, n_samples=1):
+    def random_tangent_vec(self, base_point, n_samples=1):
         """Sample on the tangent space of Siegel space from the uniform distribution.
 
         Parameters
@@ -196,40 +178,22 @@ class Siegel(ComplexOpenSet):
         samples *= 2
         samples -= 1 + 1j
 
-        return samples
+        return self.to_tangent(samples, base_point)
 
 
 class SiegelMetric(ComplexRiemannianMetric):
-    """Class for the Siegel metric.
-
-    Parameters
-    ----------
-    n : int
-        Integer representing the shape of the matrices: n x n.
-    scale : float
-        Scale of the complex Poincare metric.
-        Optional, default: 1.
-    """
-
-    def __init__(self, n, scale=1.0, **kwargs):
-        dim = int(n**2)
-        super().__init__(
-            dim=dim,
-            shape=(n, n),
-            signature=(dim, 0),
-        )
-        self.n = n
-        self.scale = scale
+    """Class for the Siegel metric."""
 
     def inner_product(self, tangent_vec_a, tangent_vec_b, base_point):
         """Compute the Siegel inner-product.
 
         Compute the inner-product of tangent_vec_a and tangent_vec_b
         at point base_point using the Siegel Riemannian metric.
-        The expression of the inner product between the vectors`v` and `w`
-        at point O is :math:`<v, w>_{O}
+        The expression of the inner product between the vectors `v` and `w`
+        at point `O` is :math:`<v, w>_{O}
         = 1/2 * trace((I - O O^{H})^{-1} v (I - O^{H} O)^{-1} w^{H})
-        + 1/2 * trace((I - O O^{H})^{-1} w (I - O^{H} O^{-1} v^{H})`
+        + 1/2 * trace((I - O O^{H})^{-1} w (I - O^{H} O)^{-1} v^{H})
+        = Re(trace((I - O O^{H})^{-1} v (I - O^{H} O)^{-1} w^{H}))`
         where H denotes the conjugate transpose operator.
 
         Parameters
@@ -246,10 +210,9 @@ class SiegelMetric(ComplexRiemannianMetric):
         inner_product : array-like, shape=[...,]
             Inner-product.
         """
-        identity = _create_identity_mat(base_point.shape, dtype=base_point.dtype)
+        identity = gs.eye(base_point.shape[-1], dtype=base_point.dtype)
 
         base_point_transconj = ComplexMatrices.transconjugate(base_point)
-        tangent_vec_a_transconj = ComplexMatrices.transconjugate(tangent_vec_a)
         tangent_vec_b_transconj = ComplexMatrices.transconjugate(tangent_vec_b)
 
         aux_1 = gs.matmul(base_point, base_point_transconj)
@@ -260,23 +223,15 @@ class SiegelMetric(ComplexRiemannianMetric):
 
         aux_4 = identity - aux_2
 
-        inv_aux_3 = HermitianMatrices.powerm(aux_3, -1)
+        inv_aux_3 = powermh(aux_3, -1)
 
-        inv_aux_4 = HermitianMatrices.powerm(aux_4, -1)
+        inv_aux_4 = powermh(aux_4, -1)
 
         aux_a = gs.matmul(inv_aux_3, tangent_vec_a)
         aux_b = gs.matmul(inv_aux_4, tangent_vec_b_transconj)
-        trace_1 = ComplexMatrices.trace_product(aux_a, aux_b)
+        trace = Matrices.trace_product(aux_a, aux_b)
 
-        aux_c = gs.matmul(inv_aux_3, tangent_vec_b)
-        aux_d = gs.matmul(inv_aux_4, tangent_vec_a_transconj)
-        trace_2 = ComplexMatrices.trace_product(aux_c, aux_d)
-
-        inner_product = trace_1 + trace_2
-        inner_product *= 0.5
-        inner_product *= self.scale**2
-
-        return inner_product
+        return gs.real(trace)
 
     @staticmethod
     def tangent_vec_from_base_point_to_zero(tangent_vec, base_point):
@@ -294,17 +249,16 @@ class SiegelMetric(ComplexRiemannianMetric):
         tangent_vec_at_zero : array-like, shape=[..., n, n]
             Tangent vector at zero (null matrix).
         """
-        identity = _create_identity_mat(base_point.shape, dtype=base_point.dtype)
+        identity = gs.eye(base_point.shape[-1], dtype=base_point.dtype)
         base_point_transconj = ComplexMatrices.transconjugate(base_point)
         aux_1 = gs.matmul(base_point, base_point_transconj)
         aux_2 = gs.matmul(base_point_transconj, base_point)
         aux_3 = identity - aux_1
         aux_4 = identity - aux_2
-        factor_1 = HermitianMatrices.powerm(aux_3, -1 / 2)
-        factor_3 = HermitianMatrices.powerm(aux_4, -1 / 2)
+        factor_1 = powermh(aux_3, -1 / 2)
+        factor_3 = powermh(aux_4, -1 / 2)
         prod_1 = gs.matmul(factor_1, tangent_vec)
-        tangent_vec_at_zero = gs.matmul(prod_1, factor_3)
-        return tangent_vec_at_zero
+        return gs.matmul(prod_1, factor_3)
 
     @staticmethod
     def exp_at_zero(tangent_vec):
@@ -322,20 +276,19 @@ class SiegelMetric(ComplexRiemannianMetric):
         exp : array-like, shape=[..., n, n]
             Point on the manifold.
         """
-        identity = _create_identity_mat(tangent_vec.shape, dtype=tangent_vec.dtype)
+        identity = gs.eye(tangent_vec.shape[-1], dtype=tangent_vec.dtype)
         tangent_vec_transconj = ComplexMatrices.transconjugate(tangent_vec)
         aux_1 = gs.matmul(tangent_vec, tangent_vec_transconj)
-        aux_2 = HermitianMatrices.powerm(aux_1, 1 / 2)
-        aux_3 = HermitianMatrices.expm(2 * aux_2)
+        aux_2 = powermh(aux_1, 1 / 2)
+        aux_3 = expmh(2 * aux_2)
         factor_1 = aux_3 - identity
         aux_4 = aux_3 + identity
-        factor_2 = HermitianMatrices.powerm(aux_4, -1)
-        factor_3 = HermitianMatrices.powerm(aux_2, -1)
+        factor_2 = powermh(aux_4, -1)
+        factor_3 = powermh(aux_2, -1)
         factor_3 = gs.where(gs.isnan(factor_3), gs.zeros_like(factor_2), factor_3)
         prod_1 = gs.matmul(factor_1, factor_2)
         prod_2 = gs.matmul(prod_1, factor_3)
-        exp = gs.matmul(prod_2, tangent_vec)
-        return exp
+        return gs.matmul(prod_2, tangent_vec)
 
     @staticmethod
     def isometry(point, point_to_zero):
@@ -356,22 +309,21 @@ class SiegelMetric(ComplexRiemannianMetric):
         point_image : array-like, shape=[..., n, n]
             Image of point by the isometry.
         """
-        identity = _create_identity_mat(point.shape, dtype=point.dtype)
+        identity = gs.eye(point.shape[-1], dtype=point.dtype)
         point_to_zero_transconj = ComplexMatrices.transconjugate(point_to_zero)
         aux_1 = gs.matmul(point_to_zero, point_to_zero_transconj)
         aux_2 = gs.matmul(point_to_zero_transconj, point_to_zero)
         aux_3 = identity - aux_1
         aux_4 = identity - aux_2
-        factor_1 = HermitianMatrices.powerm(aux_3, -1 / 2)
-        factor_4 = HermitianMatrices.powerm(aux_4, 1 / 2)
+        factor_1 = powermh(aux_3, -1 / 2)
+        factor_4 = powermh(aux_4, 1 / 2)
         factor_2 = point - point_to_zero
         aux_5 = gs.matmul(point_to_zero_transconj, point)
         aux_6 = identity - aux_5
         factor_3 = gs.linalg.inv(aux_6)
         prod_1 = gs.matmul(factor_1, factor_2)
         prod_2 = gs.matmul(prod_1, factor_3)
-        point_image = gs.matmul(prod_2, factor_4)
-        return point_image
+        return gs.matmul(prod_2, factor_4)
 
     def exp(self, tangent_vec, base_point):
         """Compute the Siegel exponential map.
@@ -414,21 +366,19 @@ class SiegelMetric(ComplexRiemannianMetric):
         log_at_zero : array-like, shape=[..., n, n]
             Riemannian logarithm at zero (null matrix).
         """
-        identity = _create_identity_mat(point.shape, dtype=point.dtype)
+        identity = gs.eye(point.shape[-1], dtype=point.dtype)
         point_transconj = ComplexMatrices.transconjugate(point)
         aux_1 = gs.matmul(point, point_transconj)
-        aux_2 = HermitianMatrices.powerm(aux_1, 1 / 2)
+        aux_2 = powermh(aux_1, 1 / 2)
         num = identity + aux_2
         den = identity - aux_2
-        inv_den = HermitianMatrices.powerm(den, -1)
+        inv_den = powermh(den, -1)
         frac = gs.matmul(num, inv_den)
         factor_1 = gs.linalg.logm(frac)
-        factor_2 = HermitianMatrices.powerm(aux_2, -1)
+        factor_2 = powermh(aux_2, -1)
         factor_2 = gs.where(gs.isnan(factor_2), gs.zeros_like(factor_2), factor_2)
         prod_1 = gs.matmul(factor_1, factor_2)
-        log_at_zero = gs.matmul(prod_1, point)
-        log_at_zero *= 0.5
-        return log_at_zero
+        return gs.matmul(prod_1, point) * 0.5
 
     @staticmethod
     def tangent_vec_from_zero_to_base_point(tangent_vec, base_point):
@@ -446,17 +396,16 @@ class SiegelMetric(ComplexRiemannianMetric):
         tangent_vec_at_base_point : array-like, shape=[..., n, n]
             Tangent vector at the base point.
         """
-        identity = _create_identity_mat(tangent_vec.shape, dtype=base_point.dtype)
+        identity = gs.eye(base_point.shape[-1], dtype=base_point.dtype)
         base_point_transconj = ComplexMatrices.transconjugate(base_point)
         aux_1 = gs.matmul(base_point, base_point_transconj)
         aux_2 = gs.matmul(base_point_transconj, base_point)
         aux_3 = identity - aux_1
         aux_4 = identity - aux_2
-        factor_1 = HermitianMatrices.powerm(aux_3, 1 / 2)
-        factor_3 = HermitianMatrices.powerm(aux_4, 1 / 2)
+        factor_1 = powermh(aux_3, 1 / 2)
+        factor_3 = powermh(aux_4, 1 / 2)
         prod_1 = gs.matmul(factor_1, tangent_vec)
-        tangent_vec_at_base_point = gs.matmul(prod_1, factor_3)
-        return tangent_vec_at_base_point
+        return gs.matmul(prod_1, factor_3)
 
     def log(self, point, base_point):
         """Compute the Siegel logarithm map.
@@ -505,7 +454,7 @@ class SiegelMetric(ComplexRiemannianMetric):
         if gs.ndim(point_a) > gs.ndim(point_b):
             point_a, point_b = point_b, point_a
 
-        identity = _create_identity_mat(point_b.shape, dtype=point_a.dtype)
+        identity = gs.eye(point_a.shape[-1], dtype=point_a.dtype)
 
         point_a_transconj = ComplexMatrices.transconjugate(point_a)
         point_b_transconj = ComplexMatrices.transconjugate(point_b)
@@ -541,12 +490,9 @@ class SiegelMetric(ComplexRiemannianMetric):
 
         logarithm = gs.linalg.logm(frac)
 
-        sq_dist = ComplexMatrices.trace_product(logarithm, logarithm)
-        sq_dist *= 0.25
+        sq_dist = Matrices.trace_product(logarithm, logarithm) * 0.25
         sq_dist = gs.real(sq_dist)
-        sq_dist *= self.scale**2
-        sq_dist = gs.maximum(sq_dist, 0)
-        return sq_dist
+        return gs.maximum(sq_dist, 0)
 
     def sectional_curvature_at_zero(self, tangent_vec_a, tangent_vec_b, atol=gs.atol):
         """Compute the sectional curvature at zero.
@@ -572,15 +518,21 @@ class SiegelMetric(ComplexRiemannianMetric):
         def _scale_by_norm(tangent_vec):
             norm_tangent_vec = self.norm(tangent_vec, base_point=zero)
             scalars = gs.where(norm_tangent_vec < atol, 0.0, 1 / norm_tangent_vec)
+            return _scale(scalars, tangent_vec)
+
+        def _scale(scalars, tangent_vec):
             return gs.einsum("...,...ij->...ij", scalars, tangent_vec)
 
-        zero = gs.zeros([self.n, self.n], dtype=tangent_vec_a.dtype)
+        zero = gs.zeros([self._space.n, self._space.n], dtype=tangent_vec_a.dtype)
 
         tangent_vec_a = _scale_by_norm(tangent_vec_a)
 
-        inner_prod = self.inner_product(tangent_vec_a, tangent_vec_b, base_point=zero)
+        inner_prod = gs.cast(
+            self.inner_product(tangent_vec_a, tangent_vec_b, base_point=zero),
+            dtype=tangent_vec_a.dtype,
+        )
 
-        tangent_vec_b -= inner_prod * tangent_vec_a
+        tangent_vec_b = tangent_vec_b - _scale(inner_prod, tangent_vec_a)
         tangent_vec_b = _scale_by_norm(tangent_vec_b)
 
         tangent_vec_a_transconj = ComplexMatrices.transconjugate(tangent_vec_a)
@@ -593,7 +545,7 @@ class SiegelMetric(ComplexRiemannianMetric):
         term2 = gs.matmul(tangent_vec_a_transconj, tangent_vec_b)
         term2 -= gs.matmul(tangent_vec_b_transconj, tangent_vec_a)
         norm_term2 = gs.linalg.norm(term2, axis=(-2, -1)) ** 2
-        return -0.5 * (norm_term1 + norm_term2) * self.scale**2
+        return -0.5 * (norm_term1 + norm_term2)
 
     def sectional_curvature(
         self, tangent_vec_a, tangent_vec_b, base_point=None, atol=gs.atol

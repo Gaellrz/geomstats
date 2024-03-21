@@ -7,144 +7,89 @@ import math
 
 import geomstats.backend as gs
 import geomstats.errors
-from geomstats.errors import ShapeError, check_point_shape
+from geomstats.geometry.complex_manifold import ComplexManifold
+from geomstats.geometry.complex_riemannian_metric import ComplexRiemannianMetric
 from geomstats.geometry.manifold import Manifold
-from geomstats.geometry.product_riemannian_metric import (
-    NFoldMetric,
-    ProductRiemannianMetric,
-)
+from geomstats.geometry.riemannian_metric import RiemannianMetric
+from geomstats.vectorization import get_batch_shape
+
+COMPLEX_OBJECTS = (ComplexRiemannianMetric, ComplexManifold)
 
 
-def broadcast_shapes(*args):
-    """
-    Broadcast the input shapes into a single shape.
+def _factor_is_complex(factor):
+    if (
+        isinstance(factor, COMPLEX_OBJECTS)
+        or hasattr(factor, "underlying_metric")
+        and isinstance(factor.underlying_metric, COMPLEX_OBJECTS)
+    ):
+        return True
 
-    This is an adaptation of the version of the function implemented in mumpy 1.20.0
-
-    Parameters
-    ----------
-    `*args` : tuples of ints, or ints
-        The shapes to be broadcast against each other.
-
-    Returns
-    -------
-    tuple
-        Broadcasted shape.
-
-    Raises
-    ------
-    ValueError
-        If the shapes are not compatible and cannot be broadcast according
-        to NumPy's broadcasting rules.
-    """
-    if len(args) == 0:
-        return ()
-    arrays = [gs.empty(x, dtype=[]) for x in args]
-    broadcasted_array = gs.broadcast_arrays(*arrays)
-    return broadcasted_array[0].shape
+    return False
 
 
-def all_equal(arg):
+def _has_mixed_fields(factors):
+    bools = [_factor_is_complex(factor) for factor in factors]
+    if len(set(bools)) == 2:
+        return True
+
+    return False
+
+
+def _all_equal(arg):
     """Check if all elements of arg are equal."""
     return arg.count(arg[0]) == len(arg)
 
 
-class ProductManifold(Manifold):
-    """Class for a product of manifolds M_1 x ... x M_n.
+def _block_diagonal(factor_matrices):
+    """Put a list of square matrices in block diagonal form."""
+    shapes_dict = {}
+    for i, matrix_i in enumerate(factor_matrices):
+        for j, matrix_j in enumerate(factor_matrices):
+            shapes_dict[(i, j)] = matrix_i.shape[:-1] + matrix_j.shape[-1:]
+    rows = []
+    # concacatenate along axis = -2
+    for i, matrix_i in enumerate(factor_matrices):
+        # concatenate along axis = -1
+        blocks_to_concatenate = []
+        for j, _ in enumerate(factor_matrices):
+            if i == j:
+                blocks_to_concatenate.append(matrix_i)
+            else:
+                blocks_to_concatenate.append(gs.zeros(shapes_dict[(i, j)]))
+        row = gs.concatenate(blocks_to_concatenate, axis=-1)
+        rows.append(row)
+    metric_matrix = gs.concatenate(rows, axis=-2)
+    return metric_matrix
 
-    In contrast to the classes NFoldManifold, Landmarks, or DiscretizedCurves,
-    the manifolds M_1, ..., M_n need not be the same, nor of
-    same dimension, but the list of manifolds needs to be provided.
 
-    Parameters
-    ----------
-    factors : list
-        List of manifolds in the product.
-    metric_scales : list
-        Optional. A list of positive numbers by which to scale the metric on each
-        factor. If not given, no scaling is used.
-    default_point_type : {'vector', 'matrix}
-        Optional. Vector representation gives the point as a 1-d array.
-        Matrix representation allows for a point to be represented by an array of shape
-        (n, dim), if each manifold has default_point_type 'vector' with shape (dim,).
-    """
+def _find_product_shape(factors, point_ndim):
+    """Determine an appropriate shape for the product from the factors."""
+    factor_shapes = [factor.shape for factor in factors]
 
+    if point_ndim is None:
+        if _all_equal(factor_shapes):
+            return len(factors), *factors[0].shape
+        point_ndim = 1
+
+    if point_ndim == 1:
+        return (sum(math.prod(factor_shape) for factor_shape in factor_shapes),)
+    if not _all_equal(factor_shapes):
+        raise ValueError(
+            "A point_ndim greater than one can only be used if all "
+            "manifolds have shape."
+        )
+    return len(factors), *factors[0].shape
+
+
+class _IterateOverFactorsMixins:
     def __init__(
-        self, factors, metric_scales=None, default_point_type="vector", **kwargs
+        self, factors, cum_index, pool_outputs, has_mixed_fields, *args, **kwargs
     ):
-        geomstats.errors.check_parameter_accepted_values(
-            default_point_type, "default_point_type", ["vector", "matrix"]
-        )
-
-        self.factors = tuple(factors)
-        self._factor_dims = [factor.dim for factor in self.factors]
-        self._factor_shapes = [factor.shape for factor in self.factors]
-        self._factor_default_coords_types = [
-            factor.default_coords_type for factor in self.factors
-        ]
-
-        dim = sum(self._factor_dims)
-
-        shape = self._find_product_shape(default_point_type)
-
-        if "extrinsic" in self._factor_default_coords_types:
-            default_coords_type = "extrinsic"
-        else:
-            default_coords_type = "intrinsic"
-
-        if metric_scales is not None:
-            for scale in metric_scales:
-                geomstats.errors.check_positive(scale)
-        kwargs.setdefault(
-            "metric",
-            ProductRiemannianMetric(
-                [manifold.metric for manifold in factors],
-                default_point_type=default_point_type,
-                scales=metric_scales,
-            ),
-        )
-
-        super().__init__(
-            dim=dim,
-            shape=shape,
-            default_coords_type=default_coords_type,
-            **kwargs,
-        )
-
-        if self.default_coords_type == "extrinsic":
-            factor_embedding_spaces = [
-                manifold.embedding_space
-                if hasattr(manifold, "embedding_space")
-                else manifold
-                for manifold in factors
-            ]
-            self.embedding_space = ProductManifold(
-                factor_embedding_spaces, metric_scales=metric_scales
-            )
-
-        self.cum_index = (
-            gs.cumsum(self._factor_dims)[:-1]
-            if self.default_coords_type == "intrinsic"
-            else gs.cumsum(self.embedding_space._factor_dims)[:-1]
-        )
-
-    def _find_product_shape(self, default_point_type):
-        """Determine an appropriate shape for the product from the factors."""
-        if default_point_type == "vector":
-            return (
-                sum([math.prod(factor_shape) for factor_shape in self._factor_shapes]),
-            )
-        if not all_equal(self._factor_shapes):
-            raise ValueError(
-                "A default_point_type of 'matrix' can only be used if all "
-                "manifolds have the same shape."
-            )
-        if not len(self._factor_shapes[0]) == 1:
-            raise ValueError(
-                "A default_point_type of 'matrix' can only be used if all "
-                "manifolds have vector type."
-            )
-        return (len(self.factors), *self.factors[0].shape)
+        self.factors = factors
+        self._cum_index = cum_index
+        self._pool_outputs = pool_outputs
+        self._has_mixed_fields = has_mixed_fields
+        super().__init__(*args, **kwargs)
 
     def embed_to_product(self, points):
         """Map a point in each factor to a point in the product.
@@ -157,7 +102,7 @@ class ProductManifold(Manifold):
 
         Returns
         -------
-        point : array-like, shape (..., self.shape)
+        point : array-like, shape (..., shape)
 
         Raises
         ------
@@ -166,27 +111,28 @@ class ProductManifold(Manifold):
             factors.
         """
         for point, factor in zip(points, self.factors):
-            check_point_shape(point, factor)
+            geomstats.errors.check_point_shape(point, factor)
 
-        if self.default_point_type == "vector":
+        if self.point_ndim == 1:
             points_ = []
-            for response, factor in zip(points, self.factors):
-                if gs.ndim(response) > len(factor.shape):
-                    response = gs.reshape(response, (-1, math.prod(response.shape[1:])))
+            for point, factor in zip(points, self.factors):
+                if gs.ndim(point) > len(factor.shape):
+                    batch_shape = get_batch_shape(factor.point_ndim, point)
+                    point = gs.reshape(point, batch_shape + (-1,))
                 else:
-                    response = gs.flatten(response)
+                    point = gs.flatten(point)
 
-                points_.append(response)
-
+                points_.append(point)
             return gs.concatenate(points_, axis=-1)
-        return gs.stack(points, axis=-2)
+        stacking_axis = -1 * len(self.shape)
+        return gs.stack(points, axis=stacking_axis)
 
     def project_from_product(self, point):
         """Map a point in the product to points in each factor.
 
         Parameters
         ----------
-        point : array-like, shape (..., self.shape)
+        point : array-like, shape (..., shape)
             The point to be projected to the factors
 
         Returns
@@ -199,27 +145,41 @@ class ProductManifold(Manifold):
         ShapeError
             If the point does not have a shape compatible with the product manifold.
         """
-        check_point_shape(point, self)
+        geomstats.errors.check_point_shape(point, self)
 
-        if self.default_point_type == "vector":
-            projected_points = gs.split(point, self.cum_index, axis=-1)
+        if self.point_ndim == 1:
+            projected_points = gs.split(point, self._cum_index, axis=-1)
             projected_points = [
                 self._reshape_trailing(projected_points[j], self.factors[j])
                 for j in range(len(self.factors))
             ]
 
         else:
-            projected_points = [point[..., j, :] for j in range(len(self.factors))]
+            splitting_axis = -1 * len(self.shape)
+            projected_points = gs.split(point, len(self.factors), axis=splitting_axis)
+            projected_points = [
+                gs.squeeze(projected_point, axis=splitting_axis)
+                for projected_point in projected_points
+            ]
+
+        if self._has_mixed_fields:
+            for i, (factor, projected_point) in enumerate(
+                zip(self.factors, projected_points)
+            ):
+                if not _factor_is_complex(factor):
+                    projected_points[i] = gs.real(projected_point)
 
         return projected_points
 
     @staticmethod
-    def _reshape_trailing(argument, manifold):
+    def _reshape_trailing(argument, factor):
         """Convert the trailing dimensions to match the shape of a factor manifold."""
-        if manifold.default_coords_type == "vector":
+        space = factor._space if isinstance(factor, RiemannianMetric) else factor
+
+        if space.point_ndim == 1:
             return argument
         leading_shape = argument.shape[:-1]
-        trailing_shape = manifold.shape
+        trailing_shape = space.shape
         new_shape = leading_shape + trailing_shape
         return gs.reshape(argument, new_shape)
 
@@ -244,7 +204,7 @@ class ProductManifold(Manifold):
 
         Returns
         -------
-        out : array-like, shape = [..., {(), self.shape}]
+        out : array-like, shape = [..., {(), shape}]
         """
         # TODO The user may prefer to provide the arguments as lists and receive them as
         # TODO lists, as this may be the form in which they are available. This should
@@ -255,7 +215,8 @@ class ProductManifold(Manifold):
             self._get_method(self.factors[i], func, args_list[i], numerical_args)
             for i in range(len(self.factors))
         ]
-        out = self._pool_outputs_from_function(out)
+        if self._pool_outputs:
+            return self._pool_outputs_from_function(out)
         return out
 
     def _validate_and_prepare_args_for_iteration(self, args):
@@ -288,9 +249,72 @@ class ProductManifold(Manifold):
         return args_list, numerical_args
 
     @staticmethod
-    def _get_method(manifold, method_name, array_args, num_args):
-        """Call manifold.method_name."""
-        return getattr(manifold, method_name)(**array_args, **num_args)
+    def _get_method(factor, method_name, array_args, num_args):
+        """Call factor.method_name."""
+        return getattr(factor, method_name)(**array_args, **num_args)
+
+
+class ProductManifold(_IterateOverFactorsMixins, Manifold):
+    """Class for a product of manifolds M_1 x ... x M_n.
+
+    In contrast to the classes NFoldManifold, Landmarks, or DiscretizedCurves,
+    the manifolds M_1, ..., M_n need not be the same, nor of
+    same dimension, but the list of manifolds needs to be provided.
+
+    Parameters
+    ----------
+    factors : tuple
+        Collection of manifolds in the product.
+    point_ndim : int or None
+        If None, defaults to 1, unless all factors have the same shape.
+    """
+
+    def __init__(self, factors, point_ndim=None, equip=True):
+        factors = tuple(factors)
+
+        factor_dims = [factor.dim for factor in factors]
+
+        dim = sum(factor_dims)
+
+        shape = _find_product_shape(factors, point_ndim)
+
+        intrinsic = all(factor.intrinsic for factor in factors)
+
+        if not intrinsic:
+            factor_embedding_spaces = [
+                (
+                    manifold.embedding_space
+                    if hasattr(manifold, "embedding_space")
+                    else manifold
+                )
+                for manifold in factors
+            ]
+            # TODO: need to revisit due to removal of scales
+            self.embedding_space = ProductManifold(
+                factor_embedding_spaces, point_ndim, equip=False
+            )
+
+        cum_index = (
+            gs.cumsum(factor_dims)[:-1]
+            if intrinsic
+            else self.embedding_space._cum_index
+        )
+
+        super().__init__(
+            factors=factors,
+            cum_index=cum_index,
+            pool_outputs=True,
+            has_mixed_fields=_has_mixed_fields(factors),
+            dim=dim,
+            shape=shape,
+            intrinsic=intrinsic,
+            equip=equip,
+        )
+
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return ProductRiemannianMetric
 
     def _pool_outputs_from_function(self, outputs):
         """Collect outputs for each product to be returned.
@@ -316,7 +340,7 @@ class ProductManifold(Manifold):
         all_arrays = gs.all([gs.is_array(factor_output) for factor_output in outputs])
         if (
             all_arrays
-            and all_equal([factor_output.shape for factor_output in outputs])
+            and _all_equal([factor_output.shape for factor_output in outputs])
             and gs.all([gs.is_bool(factor_output) for factor_output in outputs])
             or (not all_arrays)
         ):
@@ -326,7 +350,7 @@ class ProductManifold(Manifold):
 
         try:
             return self.embed_to_product(outputs)
-        except ShapeError:
+        except geomstats.errors.ShapeError:
             raise RuntimeError(
                 "Could not combine outputs - they are not points of the individual"
                 " factors."
@@ -342,7 +366,7 @@ class ProductManifold(Manifold):
 
         Parameters
         ----------
-        point : array-like, shape=[..., {dim, embedding_space.dim,
+        point : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Point.
         atol : float,
@@ -361,13 +385,13 @@ class ProductManifold(Manifold):
 
         Parameters
         ----------
-        point : array-like, shape=[..., {dim, embedding_space.dim,
+        point : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Point to be regularized.
 
         Returns
         -------
-        regularized_point : array-like, shape=[..., {dim, embedding_space.dim,
+        regularized_point : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Point in the manifold's canonical representation.
         """
@@ -378,7 +402,7 @@ class ProductManifold(Manifold):
         """Sample in the product space from the product distribution.
 
         The distribution used is the product of the distributions used by the
-        random_sample methods of each individual factor manifold.
+        random_point methods of each individual factor manifold.
 
         Parameters
         ----------
@@ -390,7 +414,7 @@ class ProductManifold(Manifold):
 
         Returns
         -------
-        samples : array-like, shape=[..., {dim, embedding_space.dim,
+        samples : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Points sampled from the manifold.
         """
@@ -399,18 +423,44 @@ class ProductManifold(Manifold):
         )
         return samples
 
+    def random_tangent_vec(self, base_point, n_samples=1):
+        """Sample on the tangent space from the product distribution.
+
+        The distribution used is the product of the distributions used by the
+        random_tangent_vec methods of each individual factor manifold.
+
+        Parameters
+        ----------
+        base_point : array-like, shape=[..., n, n]
+            Base point of the tangent space.
+            Optional, default: None.
+        n_samples : int
+            Number of samples.
+            Optional, default: 1.
+
+        Returns
+        -------
+        samples : array-like, shape=[..., {dim, embedding_space.dim, \
+            [n_manifolds, dim_each]}]
+            Points sampled in the tangent space of the product manifold at base_point.
+        """
+        samples = self._iterate_over_factors(
+            "random_tangent_vec", {"base_point": base_point, "n_samples": n_samples}
+        )
+        return samples
+
     def projection(self, point):
         """Project a point onto product manifold.
 
         Parameters
         ----------
-        point : array-like, shape=[..., {dim, embedding_space.dim,
+        point : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Point in product manifold.
 
         Returns
         -------
-        projected : array-like, shape=[..., {dim, embedding_space.dim,
+        projected : array-like, shape=[..., {dim, embedding_space.dim, \
             [n_manifolds, dim_each]}]
             Projected point.
         """
@@ -470,173 +520,213 @@ class ProductManifold(Manifold):
         return is_tangent
 
 
-class NFoldManifold(Manifold):
-    r"""Class for an n-fold product manifold :math:`M^n`.
+class ProductRiemannianMetric(_IterateOverFactorsMixins, RiemannianMetric):
+    """Class for product of Riemannian metrics."""
 
-    Define a manifold as the product manifold of n copies of a given base
-    manifold M.
+    def __init__(self, space):
+        factors = [factor.metric for factor in space.factors]
+        factor_signatures = [metric.signature for metric in factors]
 
-    Parameters
-    ----------
-    base_manifold : Manifold
-        Base manifold.
-    n_copies : int
-        Number of replication of the base manifold.
-    metric : RiemannianMetric
-        Metric object to use on the manifold.
-    default_coords_type : str, {\'intrinsic\', \'extrinsic\', etc}
-        Coordinate type.
-        Optional, default: 'intrinsic'.
-    """
-
-    def __init__(
-        self,
-        base_manifold,
-        n_copies,
-        metric=None,
-        default_coords_type="intrinsic",
-        **kwargs
-    ):
-        geomstats.errors.check_integer(n_copies, "n_copies")
-        dim = n_copies * base_manifold.dim
-        shape = (n_copies,) + base_manifold.shape
+        sig_pos = sum(sig[0] for sig in factor_signatures)
+        sig_neg = sum(sig[1] for sig in factor_signatures)
 
         super().__init__(
-            dim=dim,
-            shape=shape,
-            default_coords_type=default_coords_type,
-            **kwargs,
+            space=space,
+            factors=factors,
+            cum_index=space._cum_index,
+            pool_outputs=False,
+            has_mixed_fields=space._has_mixed_fields,
+            signature=(sig_pos, sig_neg),
         )
 
-        self.base_manifold = base_manifold
-        self.n_copies = n_copies
+    @property
+    def shape(self):
+        """Shape of space."""
+        return self._space.shape
 
-        if metric is None:
-            metric = NFoldMetric(base_manifold.metric, n_copies)
-        self.metric = metric
+    @property
+    def point_ndim(self):
+        """Point type of space."""
+        return self._space.point_ndim
 
-    def belongs(self, point, atol=gs.atol):
-        """Test if a point belongs to the manifold.
+    def metric_matrix(self, base_point=None):
+        """Compute the matrix of the inner-product.
+
+        Matrix of the inner-product defined by the Riemmanian metric
+        at point base_point of the manifold.
 
         Parameters
         ----------
-        point : array-like, shape=[..., n_copies, *base_shape]
+        base_point : array-like, shape=[..., self.shape]
+            Point on the manifold at which to compute the inner-product matrix.
+            Optional, default: None.
+
+        Returns
+        -------
+        matrix : array-like, shape as described below
+            Matrix of the inner-product at the base point.
+            The matrix is in block diagonal form with a block for each factor.
+            Each block is the same size as the metric_matrix for that factor.
+        """
+        factor_matrices = self._iterate_over_factors(
+            "metric_matrix", {"base_point": base_point}
+        )
+        return _block_diagonal(factor_matrices)
+
+    def inner_product(self, tangent_vec_a, tangent_vec_b, base_point):
+        """Compute the inner-product of two tangent vectors at a base point.
+
+        Inner product defined by the Riemannian metric at point `base_point`
+        between tangent vectors `tangent_vec_a` and `tangent_vec_b`.
+
+        Parameters
+        ----------
+        tangent_vec_a : array-like, shape=[..., self.shape]
+            First tangent vector at base point.
+        tangent_vec_b : array-like, shape=[..., self.shape]
+            Second tangent vector at base point.
+        base_point : array-like, shape=[..., self.shape]
+            Point on the manifold.
+            Optional, default: None.
+
+        Returns
+        -------
+        inner_prod : array-like, shape=[...,]
+            Inner-product of the two tangent vectors.
+        """
+        args = {
+            "tangent_vec_a": tangent_vec_a,
+            "tangent_vec_b": tangent_vec_b,
+            "base_point": base_point,
+        }
+        inner_products = self._iterate_over_factors("inner_product", args)
+        return sum(inner_products)
+
+    def squared_norm(self, vector, base_point=None):
+        """Compute the square of the norm of a vector.
+
+        Squared norm of a vector associated to the inner product
+        at the tangent space at a base point.
+
+        Parameters
+        ----------
+        vector : array-like, shape=[..., self.shape]
+            Vector.
+        base_point : array-like, shape=[..., self.shape]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        sq_norm : array-like, shape=[...,]
+            Squared norm.
+        """
+        args = {
+            "vector": vector,
+            "base_point": base_point,
+        }
+        sq_norms = self._iterate_over_factors("squared_norm", args)
+        return sum(sq_norms)
+
+    def exp(self, tangent_vec, base_point):
+        """Compute the Riemannian exponential of a tangent vector.
+
+        Parameters
+        ----------
+        tangent_vec : array-like, shape=[..., self.shape]
+            Tangent vector at a base point.
+        base_point : array-like, shape=[..., self.shape]
+            Point on the manifold.
+            Optional, default: None.
+
+        Returns
+        -------
+        exp : array-like, shape=[..., self.shape]
+            Point on the manifold equal to the Riemannian exponential
+            of tangent_vec at the base point.
+        """
+        args = {"tangent_vec": tangent_vec, "base_point": base_point}
+        exp = self._iterate_over_factors("exp", args)
+        return self._space.embed_to_product(exp)
+
+    def log(self, point, base_point):
+        """Compute the Riemannian logarithm of a point.
+
+        Parameters
+        ----------
+        point : array-like, shape=[..., self.shape]
+            Point on the manifold.
+        base_point : array-like, shape=[..., self.shape]
+            Point on the manifold.
+            Optional, default: None.
+
+        Returns
+        -------
+        log : array-like, shape=[..., self.shape]
+            Tangent vector at the base point equal to the Riemannian logarithm
+            of point at the base point.
+        """
+        args = {"point": point, "base_point": base_point}
+        logs = self._iterate_over_factors("log", args)
+        return self._space.embed_to_product(logs)
+
+    def dist(self, point_a, point_b):
+        """Geodesic distance between two points.
+
+        Parameters
+        ----------
+        point_a : array-like, shape=[..., self.shape]
             Point.
-        atol : float,
-            Tolerance.
+        point_b : array-like, shape=[..., self.shape]
+            Point.
 
         Returns
         -------
-        belongs : array-like, shape=[..., n_copies, *base_shape]
-            Boolean evaluating if the point belongs to the manifold.
+        dist : array-like, shape=[...,]
+            Distance.
         """
-        point_ = gs.reshape(point, (-1, *self.base_manifold.shape))
-        each_belongs = self.base_manifold.belongs(point_, atol=atol)
-        reshaped = gs.reshape(each_belongs, (-1, self.n_copies))
-        return gs.squeeze(gs.all(reshaped, axis=1))
+        args = {"point_a": point_a, "point_b": point_b}
+        dists = gs.array(self._iterate_over_factors("dist", args))
+        return gs.linalg.norm(dists, ord=2, axis=0)
 
-    def is_tangent(self, vector, base_point, atol=gs.atol):
-        """Check whether the vector is tangent at base_point.
+    def geodesic(self, initial_point, end_point=None, initial_tangent_vec=None):
+        """Generate parameterized function for the geodesic curve.
 
-        The tangent space of the product manifold is the direct sum of
-        tangent spaces.
+        Geodesic curve defined by either:
+
+        - an initial point and an initial tangent vector,
+        - an initial point and an end point.
 
         Parameters
         ----------
-        vector : array-like, shape=[..., n_copies, *base_shape]
-            Vector.
-        base_point : array-like, shape=[..., n_copies, *base_shape]
-            Point on the manifold.
-        atol : float
-            Absolute tolerance.
-            Optional, default: backend atol.
+        initial_point : array-like, shape=[..., dim]
+            Point on the manifold, initial point of the geodesic.
+        end_point : array-like, shape=[..., dim], optional
+            Point on the manifold, end point of the geodesic. If None,
+            an initial tangent vector must be given.
+        initial_tangent_vec : array-like, shape=[..., dim]
+            Tangent vector at base point, the initial speed of the geodesics.
+            Optional, default: None.
+            If None, an end point must be given and a logarithm is computed.
 
         Returns
         -------
-        is_tangent : bool
-            Boolean denoting if vector is a tangent vector at the base point.
+        path : callable
+            Time parameterized geodesic curve. If a batch of initial
+            conditions is passed, the output array's first dimension
+            represents the different initial conditions, and the second
+            corresponds to time.
         """
-        vector_, point_ = gs.broadcast_arrays(vector, base_point)
-        point_ = gs.reshape(point_, (-1, *self.base_manifold.shape))
-        vector_ = gs.reshape(vector_, (-1, *self.base_manifold.shape))
-        each_tangent = self.base_manifold.is_tangent(vector_, point_, atol=atol)
-        reshaped = gs.reshape(each_tangent, (-1, self.n_copies))
-        return gs.all(reshaped, axis=1)
+        args = {
+            "initial_point": initial_point,
+            "end_point": end_point,
+            "initial_tangent_vec": initial_tangent_vec,
+        }
+        geodesics = self._iterate_over_factors("geodesic", args)
 
-    def to_tangent(self, vector, base_point):
-        """Project a vector to a tangent space of the manifold.
+        def geod_fun(t):
+            t = gs.to_ndarray(t, to_ndim=1)
+            values = [geodesic(t) for geodesic in geodesics]
+            return self._space.embed_to_product(values)
 
-        The tangent space of the product manifold is the direct sum of
-        tangent spaces.
-
-        Parameters
-        ----------
-        vector : array-like, shape=[..., n_copies, *base_shape]
-            Vector.
-        base_point : array-like, shape=[..., n_copies, *base_shape]
-            Point on the manifold.
-
-        Returns
-        -------
-        tangent_vec : array-like, shape=[..., n_copies, *base_shape]
-            Tangent vector at base point.
-        """
-        vector_, point_ = gs.broadcast_arrays(vector, base_point)
-        point_ = gs.reshape(point_, (-1, *self.base_manifold.shape))
-        vector_ = gs.reshape(vector_, (-1, *self.base_manifold.shape))
-        each_tangent = self.base_manifold.to_tangent(vector_, point_)
-        reshaped = gs.reshape(
-            each_tangent, (-1, self.n_copies) + self.base_manifold.shape
-        )
-        return gs.squeeze(reshaped)
-
-    def random_point(self, n_samples=1, bound=1.0):
-        """Sample in the product space from the product distribution.
-
-        The distribution used is the product of the distributions that each copy of the
-        manifold uses in its own random_point method.
-
-        Parameters
-        ----------
-        n_samples : int, optional
-            Number of samples.
-        bound : float
-            Bound of the interval in which to sample for non compact manifolds.
-            Optional, default: 1.
-
-        Returns
-        -------
-        samples : array-like, shape=[..., n_copies, *base_shape]
-            Points sampled on the product manifold.
-        """
-        sample = self.base_manifold.random_point(n_samples * self.n_copies, bound)
-        reshaped = gs.reshape(
-            sample, (n_samples, self.n_copies) + self.base_manifold.shape
-        )
-        if n_samples > 1:
-            return reshaped
-        return gs.squeeze(reshaped, axis=0)
-
-    def projection(self, point):
-        """Project a point from product embedding manifold to the product manifold.
-
-        Parameters
-        ----------
-        point : array-like, shape=[..., n_copies, *base_shape]
-            Point in embedding manifold.
-
-        Returns
-        -------
-        projected : array-like, shape=[..., n_copies, *base_shape]
-            Projected point.
-        """
-        if hasattr(self.base_manifold, "projection"):
-            point_ = gs.reshape(point, (-1, *self.base_manifold.shape))
-            projected = self.base_manifold.projection(point_)
-            reshaped = gs.reshape(
-                projected, (-1, self.n_copies) + self.base_manifold.shape
-            )
-            return gs.squeeze(reshaped)
-        raise NotImplementedError(
-            "The base manifold does not implement a projection " "method."
-        )
+        return geod_fun

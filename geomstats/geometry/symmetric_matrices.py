@@ -3,16 +3,14 @@
 Lead author: Yann Thanwerdas.
 """
 
-import logging
-
 import geomstats.backend as gs
-import geomstats.vectorization
-from geomstats import algebra_utils
-from geomstats.geometry.base import VectorSpace
+from geomstats.geometry.base import LevelSet, MatrixVectorSpace
+from geomstats.geometry.euclidean import EuclideanMetric
 from geomstats.geometry.matrices import Matrices, MatricesMetric
+from geomstats.vectorization import repeat_out
 
 
-class SymmetricMatrices(VectorSpace):
+class SymmetricMatrices(MatrixVectorSpace):
     """Class for the vector space of symmetric matrices of size n.
 
     Parameters
@@ -21,10 +19,14 @@ class SymmetricMatrices(VectorSpace):
         Integer representing the shapes of the matrices: n x n.
     """
 
-    def __init__(self, n, **kwargs):
-        kwargs.setdefault("metric", MatricesMetric(n, n))
-        super().__init__(dim=int(n * (n + 1) / 2), shape=(n, n), **kwargs)
+    def __init__(self, n, equip=True):
+        super().__init__(dim=int(n * (n + 1) / 2), shape=(n, n), equip=equip)
         self.n = n
+
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return MatricesMetric
 
     def _create_basis(self):
         """Compute the basis of the vector space of symmetric matrices."""
@@ -78,63 +80,37 @@ class SymmetricMatrices(VectorSpace):
         """
         return Matrices.to_symmetric(point)
 
-    def random_point(self, n_samples=1, bound=1.0):
-        """Sample a symmetric matrix.
-
-        Samples from a uniform distribution in a box and then converts to symmetric.
-
-        Parameters
-        ----------
-        n_samples : int
-            Number of samples.
-            Optional, default: 1.
-        bound : float
-            Side of hypercube support of the uniform distribution.
-            Optional, default: 1.0
-
-        Returns
-        -------
-        point : array-like, shape=[..., n, n]
-           Sample.
-        """
-        sample = super().random_point(n_samples, bound)
-        return Matrices.to_symmetric(sample)
-
     @staticmethod
-    def to_vector(mat):
+    def basis_representation(matrix_representation):
         """Convert a symmetric matrix into a vector.
 
         Parameters
         ----------
-        mat : array-like, shape=[..., n, n]
+        matrix_representation : array-like, shape=[..., n, n]
             Matrix.
 
         Returns
         -------
-        vec : array-like, shape=[..., n(n+1)/2]
+        basis_representation : array-like, shape=[..., n(n+1)/2]
             Vector.
         """
-        if not gs.all(Matrices.is_symmetric(mat)):
-            logging.warning("non-symmetric matrix encountered.")
-        mat = Matrices.to_symmetric(mat)
-        return gs.triu_to_vec(mat)
+        return gs.triu_to_vec(matrix_representation)
 
     @staticmethod
-    @geomstats.vectorization.decorator(["vector", "else"])
-    def from_vector(vec):
+    def matrix_representation(basis_representation):
         """Convert a vector into a symmetric matrix.
 
         Parameters
         ----------
-        vec : array-like, shape=[..., n(n+1)/2]
+        basis_representation : array-like, shape=[..., n(n+1)/2]
             Vector.
 
         Returns
         -------
-        mat : array-like, shape=[..., n, n]
+        matrix_representation : array-like, shape=[..., n, n]
             Symmetric matrix.
         """
-        vec_dim = vec.shape[-1]
+        vec_dim = basis_representation.shape[-1]
         mat_dim = (gs.sqrt(8.0 * vec_dim + 1) - 1) / 2
         if mat_dim != int(mat_dim):
             raise ValueError(
@@ -145,97 +121,265 @@ class SymmetricMatrices(VectorSpace):
         shape = (mat_dim, mat_dim)
         mask = 2 * gs.ones(shape) - gs.eye(mat_dim)
         indices = list(zip(*gs.triu_indices(mat_dim)))
-        upper_triangular = gs.stack(
-            [gs.array_from_sparse(indices, data, shape) for data in vec]
-        )
+        if gs.ndim(basis_representation) == 1:
+            upper_triangular = gs.array_from_sparse(
+                indices, basis_representation, shape
+            )
+        else:
+            upper_triangular = gs.stack(
+                [
+                    gs.array_from_sparse(indices, data, shape)
+                    for data in basis_representation
+                ]
+            )
+
         mat = Matrices.to_symmetric(upper_triangular) * mask
         return mat
 
-    @classmethod
-    def expm(cls, mat):
-        """Compute the matrix exponential for a symmetric matrix.
 
-        Parameters
-        ----------
-        mat : array_like, shape=[..., n, n]
-            Symmetric matrix.
+class SymmetricHollowMatrices(LevelSet, MatrixVectorSpace):
+    r"""Space of symmetric hollow matrices.
 
-        Returns
-        -------
-        exponential : array_like, shape=[..., n, n]
-            Exponential of mat.
-        """
-        n = mat.shape[-1]
-        dim_3_mat = gs.reshape(mat, [-1, n, n])
-        expm = cls.apply_func_to_eigvals(dim_3_mat, gs.exp)
-        expm = gs.reshape(expm, mat.shape)
-        return expm
+    Set of symmetric matrices with null diagonal:
 
-    @classmethod
-    def powerm(cls, mat, power):
-        """
-        Compute the matrix power.
+    .. math::
 
-        Parameters
-        ----------
-        mat : array_like, shape=[..., n, n]
-            Symmetric matrix with non-negative eigenvalues.
-        power : float, list
-            Power at which mat will be raised. If a list of powers is passed,
-            a list of results will be returned.
+        \operatorname{Hol}(n) = \{X \in \operatorname{Sym}(n)
+        \mid \operatorname{Diag}(X)=0\}
 
-        Returns
-        -------
-        powerm : array_like or list of arrays, shape=[..., n, n]
-            Matrix power of mat.
-        """
-        if isinstance(power, list):
-            power_ = [lambda ev, p=p: gs.power(ev, p) for p in power]
-        else:
+    Parameters
+    ----------
+    n : int
+        Integer representing the shapes of the matrices: n x n.
 
-            def power_(ev):
-                return gs.power(ev, power)
+    References
+    ----------
+    .. [T2022] Yann Thanwerdas. Riemannian and stratified
+    geometries on covariance and correlation matrices. Differential
+    Geometry [math.DG]. Université Côte d'Azur, 2022.
+    """
 
-        return cls.apply_func_to_eigvals(mat, power_, check_positive=False)
+    def __init__(self, n, equip=True):
+        self.n = n
+        super().__init__(dim=int(n * (n - 1) / 2), shape=(n, n), equip=equip)
 
     @staticmethod
-    def apply_func_to_eigvals(mat, function, check_positive=False):
-        """
-        Apply function to eigenvalues and reconstruct the matrix.
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return MatricesMetric
+
+    def _define_embedding_space(self):
+        return SymmetricMatrices(n=self.n)
+
+    def submersion(self, point):
+        """Submersion that defines the manifold.
 
         Parameters
         ----------
-        mat : array_like, shape=[..., n, n]
-            Symmetric matrix.
-        function : callable, list of callables
-            Function to apply to eigenvalues. If a list of functions is passed,
-            a list of results will be returned.
-        check_positive : bool
-            Whether to check positivity of the eigenvalues.
-            Optional. Default: False.
+        point : array-like, shape=[..., n, n]
 
         Returns
         -------
-        mat : array_like, shape=[..., n, n]
-            Symmetric matrix.
+        submersed_point : array-like, shape=[..., n]
         """
-        eigvals, eigvecs = gs.linalg.eigh(mat)
-        if check_positive and gs.any(eigvals < 0.0):
-            try:
-                name = function.__name__
-            except AttributeError:
-                name = function[0].__name__
+        return Matrices.diagonal(point)
 
-            logging.warning("Negative eigenvalue encountered in" " {}".format(name))
+    def tangent_submersion(self, vector, point):
+        """Tangent submersion.
 
-        return_list = True
-        if not isinstance(function, list):
-            function = [function]
-            return_list = False
-        reconstruction = []
-        transp_eigvecs = Matrices.transpose(eigvecs)
-        for fun in function:
-            eigvals_f = fun(eigvals)
-            eigvals_f = algebra_utils.from_vector_to_diagonal_matrix(eigvals_f)
-            reconstruction.append(Matrices.mul(eigvecs, eigvals_f, transp_eigvecs))
-        return reconstruction if return_list else reconstruction[0]
+        Parameters
+        ----------
+        vector : array-like, shape=[..., n, n]
+        point : Ignored.
+
+        Returns
+        -------
+        submersed_vector : array-like, shape=[..., n]
+        """
+        out = self.submersion(vector)
+        return repeat_out(self.point_ndim, out, vector, point, out_shape=(self.n,))
+
+    def _create_basis(self):
+        """Compute the basis of the vector space of hollow symmetric matrices."""
+        indices, values = [], []
+        k = -1
+        for row in range(self.n):
+            for col in range(row + 1, self.n):
+                k += 1
+                indices.extend([(k, row, col), (k, col, row)])
+                values.extend([1.0, 1.0])
+
+        return gs.array_from_sparse(indices, values, (k + 1, self.n, self.n))
+
+    @staticmethod
+    def basis_representation(matrix_representation):
+        """Convert a hollow symmetric matrix into a vector.
+
+        Parameters
+        ----------
+        matrix_representation : array-like, shape=[..., n, n]
+            Matrix.
+
+        Returns
+        -------
+        vec : array-like, shape=[..., n(n+1)/2]
+            Vector.
+        """
+        return gs.triu_to_vec(matrix_representation, k=1)
+
+    def projection(self, point):
+        """Project a point in embedding manifold on embedded manifold.
+
+        Parameters
+        ----------
+        point : array-like, shape=[..., *embedding_space.point_shape]
+            Point in embedding manifold.
+
+        Returns
+        -------
+        projected : array-like, shape=[..., *point_shape]
+            Projected point.
+        """
+        return point - Matrices.to_diagonal(point)
+
+
+class HollowMatricesPermutationInvariantMetric(EuclideanMetric):
+    r"""A permutation-invariant metric on the space of hollow matrices.
+
+    It is flat Riemannian metric invariant by the congruence action
+    of permutation matrices defined over a matrix vector space.
+
+    Its associated quadratic form is:
+
+    .. math::
+
+        (X)=\alpha \operatorname{tr}\left(X^2\right)
+        +\beta \operatorname{Sum}\left(X^2\right)
+        +\gamma \operatorname{Sum}(X)^2
+
+    Parameters
+    ----------
+    space : Manifold
+    alpha : float
+        Scalar multiplying first term of quadratic form.
+    beta : float
+        Scalar multiplying second term of quadratic form.
+    gamma : float
+        Scalar multiplying third term of quadratic form.
+
+    Check out chapter 8 of [T2022]_ for more details.
+
+    References
+    ----------
+    .. [T2022] Yann Thanwerdas. Riemannian and stratified
+    geometries on covariance and correlation matrices. Differential
+    Geometry [math.DG]. Université Côte d'Azur, 2022.
+    """
+
+    def __init__(self, space, alpha=1.0, beta=1.0, gamma=1.0):
+        self._check_params(space, alpha, beta, gamma)
+        super().__init__(space=space)
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+
+    @staticmethod
+    def _check_params(space, alpha, beta, gamma):
+        r"""Check parameters of quadratic form.
+
+        The following conditions must verify:
+        - n > 3: :math:`\alpha>0,2 \alpha+(n-2) \beta>0, \alpha+(n-1)(\beta+n \gamma)>0`
+        - n = 3: :math:`\alpha=0, \beta > 0, \beta+3 \gamma>0`
+        - n = 2: :math:`\alpha=0, \beta=0, \gamma > 0`
+        """
+        n = space.n
+        if n == 2:
+            if alpha > gs.atol or beta > gs.atol or gamma < gs.atol:
+                raise ValueError(
+                    f"When n==2: alpha ({alpha}) and beta({beta}) must be 0,"
+                    f"and gamma ({gamma}) > 0. "
+                )
+            return
+
+        elif n == 3:
+            cond = beta + 3 * gamma
+            if alpha > gs.atol or beta < gs.atol or cond < gs.atol:
+                raise ValueError(
+                    f"When n==3: alpha ({alpha}) must be 0, beta ({beta}) > 0"
+                    f"and an inequality greater than 0: {cond}."
+                    "Check thanwerdas2022 theorem 8.7"
+                )
+            return
+
+        cond_1 = 2 * alpha + (n - 2) * beta
+        cond_2 = alpha + (n - 1) * (beta + n * gamma)
+        if cond_1 < gs.atol or cond_2 < gs.atol:
+            raise ValueError(
+                f"Inequalities should be greater than 0, but: {cond_1} and {cond_2}."
+                "Check thanwerdas2022 theorem 8.7"
+            )
+
+    def _quadratic_form(self, tangent_vec):
+        """Quadratic form associated to inner product.
+
+        Parameters
+        ----------
+        tangent_vec: array-like, shape=[..., dim]
+            Tangent vector at base point.
+        """
+        comp = gs.matmul(tangent_vec, tangent_vec)
+        out_alpha = self.alpha * gs.trace(comp) if self.alpha > gs.atol else 0.0
+        out_beta = (
+            self.beta * gs.sum(comp, axis=(-2, -1)) if self.beta > gs.atol else 0.0
+        )
+        out_gamma = self.gamma * gs.sum(tangent_vec, axis=(-2, -1)) ** 2
+
+        return out_alpha + out_beta + out_gamma
+
+    def inner_product(self, tangent_vec_a, tangent_vec_b, base_point=None):
+        """Inner product between two tangent vectors at a base point.
+
+        Parameters
+        ----------
+        tangent_vec_a: array-like, shape=[..., dim]
+            Tangent vector at base point.
+        tangent_vec_b: array-like, shape=[..., dim]
+            Tangent vector at base point.
+        base_point: array-like, shape=[..., dim]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        inner_product : array-like, shape=[...,]
+            Inner-product.
+        """
+        inner_prod = (1 / 2) * (
+            self._quadratic_form(tangent_vec_a + tangent_vec_b)
+            - self._quadratic_form(tangent_vec_a)
+            - self._quadratic_form(tangent_vec_b)
+        )
+        return repeat_out(
+            self._space.point_ndim, inner_prod, tangent_vec_a, tangent_vec_b, base_point
+        )
+
+    def squared_norm(self, vector, base_point=None):
+        """Compute the square of the norm of a vector.
+
+        Squared norm of a vector associated to the inner product
+        at the tangent space at a base point.
+
+        Parameters
+        ----------
+        vector : array-like, shape=[..., dim]
+            Vector.
+        base_point : array-like, shape=[..., dim]
+            Base point.
+            Optional, default: None.
+
+        Returns
+        -------
+        sq_norm : array-like, shape=[...,]
+            Squared norm.
+        """
+        return self._quadratic_form(vector)

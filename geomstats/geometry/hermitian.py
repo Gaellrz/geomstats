@@ -20,25 +20,23 @@ class Hermitian(ComplexVectorSpace):
         Dimension of the Hermitian space.
     """
 
-    def __init__(self, dim, **kwargs):
-        kwargs.setdefault("metric", HermitianMetric(dim, shape=(dim,)))
-        super().__init__(shape=(dim,), **kwargs)
+    def __init__(self, dim, equip=True):
+        super().__init__(shape=(dim,), equip=equip)
 
-    def get_identity(self):
-        """Get the identity of the group.
+    @staticmethod
+    def default_metric():
+        """Metric to equip the space with if equip is True."""
+        return HermitianMetric
+
+    @property
+    def identity(self):
+        """Identity of the group.
 
         Returns
         -------
         identity : array-like, shape=[n]
         """
-        identity = gs.zeros(self.dim, dtype=gs.get_default_cdtype())
-        return identity
-
-    identity = property(get_identity)
-
-    def _create_basis(self):
-        """Create the canonical basis."""
-        return gs.eye(self.dim, dtype=gs.get_default_cdtype())
+        return gs.zeros(self.dim, dtype=gs.get_default_cdtype())
 
     def exp(self, tangent_vec, base_point=None):
         """Compute the group exponential, which is simply the addition.
@@ -55,8 +53,6 @@ class Hermitian(ComplexVectorSpace):
         point : array-like, shape=[..., n]
             Group exponential.
         """
-        if not self.belongs(tangent_vec):
-            raise ValueError("The update must be of the same dimension")
         return tangent_vec + base_point
 
 
@@ -68,19 +64,7 @@ class HermitianMetric(ComplexRiemannianMetric):
     - flat: the inner-product is independent of the base point.
     - positive definite: it has signature (dimension, 0, 0),
       where dimension is the dimension of the Hermitian space.
-
-    Parameters
-    ----------
-    dim : int
-        Dimension of the Hermitian space.
     """
-
-    def __init__(self, dim, shape=None):
-        super().__init__(
-            dim=dim,
-            shape=shape,
-            signature=(dim, 0),
-        )
 
     def metric_matrix(self, base_point=None):
         """Compute the inner-product matrix, independent of the base point.
@@ -96,9 +80,9 @@ class HermitianMetric(ComplexRiemannianMetric):
         inner_prod_mat : array-like, shape=[..., dim, dim]
             Inner-product matrix.
         """
-        mat = gs.eye(self.dim, dtype=gs.get_default_cdtype())
+        mat = gs.eye(self._space.dim, dtype=gs.get_default_cdtype())
         if base_point is not None and base_point.ndim > 1:
-            mat = gs.broadcast_to(mat, base_point.shape + (self.dim,))
+            return gs.broadcast_to(mat, base_point.shape + (self._space.dim,))
         return mat
 
     @staticmethod
@@ -148,7 +132,7 @@ class HermitianMetric(ComplexRiemannianMetric):
         return gs.linalg.norm(vector, axis=-1)
 
     @staticmethod
-    def exp(tangent_vec, base_point, **kwargs):
+    def exp(tangent_vec, base_point):
         """Compute exp map of a base point in tangent vector direction.
 
         The Riemannian exponential is vector addition in the Hermitian space.
@@ -165,11 +149,10 @@ class HermitianMetric(ComplexRiemannianMetric):
         exp : array-like, shape=[..., dim]
             Riemannian exponential.
         """
-        exp = base_point + tangent_vec
-        return exp
+        return base_point + tangent_vec
 
     @staticmethod
-    def log(point, base_point, **kwargs):
+    def log(point, base_point):
         """Compute log map using a base point and other point.
 
         The Riemannian logarithm is the subtraction in the Hermitian space.
@@ -186,5 +169,4 @@ class HermitianMetric(ComplexRiemannianMetric):
         log: array-like, shape=[..., dim]
             Riemannian logarithm.
         """
-        log = point - base_point
-        return log
+        return point - base_point
